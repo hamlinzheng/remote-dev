@@ -154,6 +154,16 @@ class InstallationTests(unittest.TestCase):
         self.assertFalse(c.unit_file.exists())
         self.assertFalse((self.home / '.local/bin/remote-dev').exists())
 
+    def test_install_notes_missing_xclip_without_failing(self):
+        c, _ = self.local_fixture()
+        for found, expected in [(None, True), ('/usr/bin/xclip', False)]:
+            with self.subTest(xclip=found), patch.object(install, 'local_install'), \
+                    patch.object(c, 'service_active', return_value=False), \
+                    patch.object(install.shutil, 'which', return_value=found), \
+                    patch('sys.stdout', new_callable=io.StringIO) as output:
+                install.install(c, ROOT)
+            self.assertEqual('xclip not found' in output.getvalue(), expected)
+
     def test_install_after_uninstall_reuses_retained_config(self):
         c, runtime = self.local_fixture()
         with patch.object(install, 'find_node', return_value=Path('/usr/bin/node')), \

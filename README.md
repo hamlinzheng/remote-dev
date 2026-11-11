@@ -34,7 +34,7 @@ DevSpace handles local files and commands. Chrome DevTools MCP runs remotely and
 | OAuth callback | Local browser → remote client callback | `8765` |
 | Clipboard images | Remote loopback → local clipboard socket | `7677` |
 
-Image paste: `Ctrl+V` in remote Claude runs a remote `xclip` shim that reads images (never text) from the local X11 clipboard through `7677`, authenticated by a per-connection token. Local `xclip` is required. Copying text out uses OSC 52, so use a terminal that supports it (for example WezTerm; GNOME Terminal does not).
+Image paste: `Ctrl+V` in remote Claude runs a remote `xclip` shim that reads images (never text) from the local X11 clipboard through `7677`, authenticated by a per-connection token. Copying text out needs no forward: remote Claude always uses OSC 52 over SSH, which the local terminal writes to the clipboard. In Claude's fullscreen renderer (`/tui fullscreen`) selecting text copies it; hold Shift for the terminal's native selection.
 
 ## Requirements
 
@@ -44,6 +44,8 @@ Image paste: `Ctrl+V` in remote Claude runs a remote `xclip` shim that reads ima
 | Node.js | Node 24 and npm, for DevSpace | Compatible Node and npm, only for browser mode |
 | Claude Code | Not required | Installed and authenticated |
 | Chrome | `google-chrome` and a desktop display, only for browser mode | Not required |
+| Terminal | OSC 52 clipboard support to copy Claude output, such as WezTerm or kitty; VTE terminals (GNOME Terminal, Terminator) ignore it | Not required |
+| Clipboard | X11 and `xclip` (`sudo apt install xclip`), only for image paste | Not required |
 
 `--with-node` permits a private Node 24.22.2 download for Linux x64/arm64 when no compatible runtime exists. The archive is checked against official SHA256 checksums. Existing compatible Node is reused; other prerequisites remain user-managed. No sudo or shell/account changes are required.
 

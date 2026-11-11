@@ -364,6 +364,8 @@ def install(app, root, host=None, port=22, identity_file=None, browser=False, in
             raise RuntimeError('Stop shared access before install')
         local_install(app, root, browser, install_node)
         print('Local install complete. DevSpace is stopped; no automatic startup was enabled.', flush=True)
+        if not shutil.which('xclip'):
+            print('Note: xclip not found; image paste is disabled until it is installed (sudo apt install xclip).', flush=True)
         if host:
             remote_call(root, host, port, identity_file, browser, install_node)
     print('Installation complete. Run remote-dev start with an explicit SSH target.')
