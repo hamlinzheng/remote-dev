@@ -288,6 +288,150 @@ class CliTests(unittest.TestCase):
                 self.c.start('other@host', 22, False)
         self.assertEqual(self.c.read_connection()['host'], 'user@host')
 
+    def browser_environment(self, *, browser=False, fail_forward=False, timeout_forward=False, interrupt=False):
+        self.connection(browser=browser)
+        child = self.child()
+        app.atomic_json(self.c.sessions_dir / 'existing.json', {
+            'id': 'existing', 'client': 'claude', 'paths': [str(self.home)],
+            'ssh': app.process_record(child.pid)})
+        browser_alive = self.home / 'browser-alive'
+        forwarding = self.home / 'browser-forward'
+        if browser:
+            forwarding.touch()
+        def browser_start():
+            created = not browser_alive.exists()
+            browser_alive.touch()
+            if interrupt:
+                os.kill(os.getpid(), signal.SIGINT)
+            return {'created_browser': created, 'session_stamp': 'browser-stamp', 'chrome_running': True}
+        def browser_stop(expected_stamp=None):
+            self.assertEqual(expected_stamp, 'browser-stamp')
+            browser_alive.unlink(missing_ok=True)
+        def run(args, **kwargs):
+            if '-O' not in args:
+                self.assertIn('-T', args)
+                payload = json.loads(shlex.split(args[-1])[3])
+                self.assertEqual(payload['action'], 'prepare')
+                self.assertTrue(payload['browser'])
+                return subprocess.CompletedProcess(args, 0, '', '')
+            action = args[args.index('-O') + 1]
+            if action in ['forward', 'cancel']:
+                self.assertIn('-R', args)
+                self.assertIn('127.0.0.1:9222:127.0.0.1:9222', args)
+                if action == 'forward':
+                    if fail_forward:
+                        return subprocess.CompletedProcess(args, 1, '', 'remote port occupied')
+                    if forwarding.exists():
+                        raise AssertionError('duplicate forwarding request')
+                    forwarding.touch()
+                    if timeout_forward:
+                        raise subprocess.TimeoutExpired(args, 5)
+                else:
+                    forwarding.unlink(missing_ok=True)
+            else:
+                self.assertEqual(action, 'check')
+            return subprocess.CompletedProcess(args, 0, '', '')
+        for manager in [
+                patch.object(self.c, 'service_active', return_value=True),
+                patch.object(self.c, 'systemctl', side_effect=AssertionError('service changed')),
+                patch.object(self.c.browser, 'start', side_effect=browser_start),
+                patch.object(self.c.browser, 'stop', side_effect=browser_stop),
+                patch.object(app.subprocess, 'run', side_effect=run)]:
+            manager.start()
+            self.addCleanup(manager.stop)
+        return child, browser_alive, forwarding
+
+    def test_start_enables_browser_without_restarting_existing_sessions(self):
+        child, browser_alive, forwarding = self.browser_environment()
+        self.c.start('user@host', 22, True)
+        value = self.c.read_connection()
+        self.assertTrue(value['browser'])
+        self.assertTrue(value['browser_owned'])
+        self.assertEqual(value['id'], 'bridge')
+        self.assertTrue(browser_alive.exists())
+        self.assertTrue(forwarding.exists())
+        self.assertIsNone(child.poll())
+        self.assertTrue((self.c.sessions_dir / 'existing.json').is_file())
+        self.c.start('user@host', 22, True)
+        self.assertTrue(self.c.read_connection()['browser_owned'])
+
+    def test_start_reopens_closed_browser_without_adding_duplicate_forward(self):
+        child, browser_alive, forwarding = self.browser_environment(browser=True)
+        self.c.start('user@host', 22, True)
+        self.assertTrue(browser_alive.exists())
+        self.assertTrue(forwarding.exists())
+        self.assertTrue(self.c.read_connection()['browser_owned'])
+        self.assertIsNone(child.poll())
+
+    def test_browser_forward_failure_preserves_connection_and_sessions(self):
+        child, browser_alive, forwarding = self.browser_environment(fail_forward=True)
+        before = self.c.read_connection()
+        with self.assertRaisesRegex(RuntimeError, 'remote port occupied'):
+            self.c.start('user@host', 22, True)
+        self.assertEqual(self.c.read_connection(), before)
+        self.assertFalse(browser_alive.exists())
+        self.assertFalse(forwarding.exists())
+        self.assertIsNone(child.poll())
+
+    def test_browser_record_failure_cancels_added_forward(self):
+        child, browser_alive, forwarding = self.browser_environment()
+        before = self.c.read_connection()
+        original = self.c.write_connection
+        def write(value):
+            if value['browser']:
+                raise OSError('disk full')
+            return original(value)
+        with patch.object(self.c, 'write_connection', side_effect=write):
+            with self.assertRaisesRegex(OSError, 'disk full'):
+                self.c.start('user@host', 22, True)
+        self.assertEqual(self.c.read_connection(), before)
+        self.assertFalse(browser_alive.exists())
+        self.assertFalse(forwarding.exists())
+        self.assertIsNone(child.poll())
+
+    def test_browser_forward_timeout_cancels_uncertain_forward(self):
+        child, browser_alive, forwarding = self.browser_environment(timeout_forward=True)
+        before = self.c.read_connection()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.c.start('user@host', 22, True)
+        self.assertFalse(forwarding.exists())
+        self.assertFalse(browser_alive.exists())
+        self.assertEqual(self.c.read_connection(), before)
+        self.assertIsNone(child.poll())
+
+    def test_interrupted_browser_upgrade_rolls_back_only_new_resources(self):
+        child, browser_alive, forwarding = self.browser_environment(interrupt=True)
+        before = self.c.read_connection()
+        with self.assertRaises(KeyboardInterrupt):
+            self.c.start('user@host', 22, True)
+        self.assertFalse(browser_alive.exists())
+        self.assertFalse(forwarding.exists())
+        self.assertEqual(self.c.read_connection(), before)
+        self.assertIsNone(child.poll())
+
+    def test_browser_prepare_failure_does_not_create_local_resources(self):
+        child, browser_alive, forwarding = self.browser_environment()
+        before = self.c.read_connection()
+        with patch.object(app.subprocess, 'run', side_effect=[
+                subprocess.CompletedProcess([], 0, '', ''),
+                subprocess.CalledProcessError(1, ['ssh'])]):
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.c.start('user@host', 22, True)
+        self.assertEqual(self.c.read_connection(), before)
+        self.assertFalse(browser_alive.exists())
+        self.assertFalse(forwarding.exists())
+        self.assertIsNone(child.poll())
+
+    def test_failed_browser_upgrade_preserves_borrowed_chrome(self):
+        child, browser_alive, forwarding = self.browser_environment(fail_forward=True)
+        browser_alive.touch()
+        with self.assertRaisesRegex(RuntimeError, 'remote port occupied'):
+            self.c.start('user@host', 22, True)
+        self.assertTrue(browser_alive.exists())
+        self.assertFalse(self.c.read_connection()['browser'])
+        self.assertFalse(forwarding.exists())
+        self.assertIsNone(child.poll())
+
     def test_stop_holds_lifecycle_lock_until_watcher_is_stopped(self):
         self.connection(watcher_owned=True)
         interleaved = self.home / 'new-start-interleaved'

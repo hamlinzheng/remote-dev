@@ -81,7 +81,9 @@ remote-dev stop
 | `--ssh-port PORT` | SSH port for install/start/uninstall; default `22` |
 | `--with-node` | Permit private Node installation when needed |
 
-Every new `start` needs an explicit target. No default host or identity is saved. `-i` is optional when SSH already has a usable identity or agent. Repeating `start` with identical options reuses access; changing options requires `stop`. Neither `start` nor `open` installs or updates dependencies.
+Every new `start` needs an explicit target. No default host or identity is saved. `-i` is optional when SSH already has a usable identity or agent. Repeating `start` reuses access. With the same host, port and identity, adding `--browser` enables Chrome and its SSH forward without interrupting existing sessions. Repeat it to reopen Chrome after closing it. Other option changes require `stop`. Neither `start` nor `open` installs or updates dependencies.
+
+Browser support must already be prepared with `install --host USER@HOST --browser`. Closing Chrome leaves SSH, DevSpace and Claude running, but browser tools become unavailable. After enabling or reopening it, reconnect `local-chrome` through Claude's `/mcp` if needed and tell existing sessions that browser access is enabled.
 
 An optional SSH alias shortens the command:
 

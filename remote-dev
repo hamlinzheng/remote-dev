@@ -231,9 +231,9 @@ class Controller:
                 '-o', 'ProxyCommand=false', '-o', 'BatchMode=yes',
                 '-o', 'ForwardAgent=no', values['host'], command]
 
-    def control(self, values, action):
+    def control(self, values, action, *args):
         return subprocess.run(['ssh', '-S', str(self.ssh_socket), '-O', action,
-            '-p', str(values['ssh_port']), '-o', 'BatchMode=yes', values['host']],
+            *args, '-p', str(values['ssh_port']), '-o', 'BatchMode=yes', values['host']],
             capture_output=True, text=True, timeout=5)
 
     def connection_ready(self, values):
@@ -253,6 +253,41 @@ class Controller:
             time.sleep(0.2)
         raise RuntimeError('DevSpace did not become healthy; inspect journalctl --user -u ' + UNIT)
 
+    def enable_browser(self, values):
+        subprocess.run(self.channel_command(values, remote_command('prepare', browser=True), tty=False), check=True)
+        forward = ('-R', '127.0.0.1:9222:127.0.0.1:9222')
+        updated = dict(values)
+        cancel_forward = recorded = False
+        acquired = None
+        try:
+            with defer_signals():
+                acquired = self.browser.start()
+                updated['browser_owned'] = acquired['created_browser'] or (
+                    values.get('browser_owned', False) and values.get('browser_stamp') == acquired['session_stamp'])
+                updated['browser_stamp'] = acquired['session_stamp']
+                self.write_connection(updated)
+                recorded = True
+                if not values['browser']:
+                    cancel_forward = True
+                    result = self.control(values, 'forward', *forward)
+                    if result.returncode:
+                        cancel_forward = False
+                        raise RuntimeError('Browser forwarding failed: ' + result.stderr.strip())
+                updated['browser'] = True
+                self.write_connection(updated)
+        except BaseException:
+            with defer_signals():
+                if cancel_forward:
+                    result = self.control(values, 'cancel', *forward)
+                    if result.returncode:
+                        raise RuntimeError('Browser forwarding rollback failed; inspect status and retry stop: '
+                                           + result.stderr.strip())
+                if acquired and acquired['created_browser']:
+                    self.browser.stop(expected_stamp=acquired['session_stamp'])
+                if recorded:
+                    self.write_connection(values)
+            raise
+
     def start(self, host, port, browser, identity_file=None):
         validate_host(host)
         ssh_options(port, identity_file)
@@ -263,10 +298,13 @@ class Controller:
                 with self.lock():
                     existing = self.read_connection()
                     if existing:
-                        current = (existing['host'], existing['ssh_port'], existing['browser'],
-                                   existing.get('identity_file'))
-                        if current == (host, port, browser, identity_file) and self.connection_ready(existing):
-                            print('Shared connection is already running.')
+                        current = (existing['host'], existing['ssh_port'], existing.get('identity_file'))
+                        if (current == (host, port, identity_file) and (browser or not existing['browser'])
+                                and self.connection_ready(existing)):
+                            if browser:
+                                self.enable_browser(existing)
+                            print('Shared connection and browser are ready.' if browser
+                                  else 'Shared connection is already running.')
                             return
                         raise RuntimeError('A connection is recorded; inspect status and run stop before changing it')
                     if self.service_active() or self.ssh_socket.exists():
