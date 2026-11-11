@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import signal
 import socket
@@ -26,6 +27,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from lib.common import atomic_json, private_dir, process_record, ssh_options, validate_host
 from lib.browser import Controller as Browser
+from lib import clipboard
 from lib import install as provisioning
 
 
@@ -105,12 +107,23 @@ if settings['action'] == 'prepare':
         raise SystemExit('Run remote-dev install --host USER@HOST first; local-dev MCP is missing')
     if settings['browser'] and not config.get('mcpServers', {}).get('local-chrome'):
         raise SystemExit('Run remote-dev install --host USER@HOST --browser first')
+    request = sys.stdin.read()
+    if request:
+        request = json.loads(request)
+        data = home / '.local/share/remote-dev'
+        (data / 'bin').mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(data, 0o700)
+        (data / 'clipboard.token').write_text(request['token'])
+        shim = data / 'bin/xclip'
+        shim.write_text(request['xclip'])
+        shim.chmod(0o700)
     print('Remote Claude and local-dev MCP are ready.', flush=True)
     raise SystemExit(0)
 if not existing:
     raise SystemExit('local-dev MCP is missing; stop access and run remote-dev install --host USER@HOST')
 identity = json.dumps({key: settings[key] for key in ['hostname', 'paths']}, sort_keys=True).encode()
 base = home / '.local/share/remote-dev'
+os.environ['PATH'] = str(base / 'bin') + os.pathsep + os.environ['PATH']
 workspaces = base / 'workspaces'
 workspaces.mkdir(parents=True, exist_ok=True, mode=0o700)
 os.chmod(base, 0o700)
@@ -174,6 +187,7 @@ class Controller:
         self.connection_file = self.runtime / 'connection.json'
         self.sessions_dir = self.runtime / 'sessions'
         self.ssh_socket = self.runtime / 'ssh.sock'
+        self.clipboard_socket = self.runtime / 'clipboard.sock'
         self.browser = Browser(self.home)
 
     @contextlib.contextmanager
@@ -223,6 +237,7 @@ class Controller:
                 '-o', 'ExitOnForwardFailure=yes',
                 '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2',
                 '-R', '127.0.0.1:7676:127.0.0.1:7676',
+                '-R', '127.0.0.1:%d:%s' % (clipboard.PORT, self.clipboard_socket),
                 '-L', '127.0.0.1:8765:127.0.0.1:8765']
         if values['browser']:
             args += ['-R', '127.0.0.1:9222:127.0.0.1:9222']
@@ -257,8 +272,15 @@ class Controller:
             time.sleep(0.2)
         raise RuntimeError('DevSpace did not become healthy; inspect journalctl --user -u ' + UNIT)
 
+    def prepare(self, values, browser):
+        """Check the remote side and install the clipboard shim and token over stdin."""
+        token = values.get('clipboard_token')
+        request = json.dumps({'token': token, 'xclip': clipboard.SHIM}) if token else ''
+        subprocess.run(self.channel_command(values, remote_command('prepare', browser=browser), tty=False),
+                       input=request, text=True, check=True)
+
     def enable_browser(self, values):
-        subprocess.run(self.channel_command(values, remote_command('prepare', browser=True), tty=False), check=True)
+        self.prepare(values, True)
         forward = ('-R', '127.0.0.1:9222:127.0.0.1:9222')
         updated = dict(values)
         cancel_forward = recorded = False
@@ -321,7 +343,7 @@ class Controller:
                     require_free_port(8765)
                     values = {'id': str(uuid.uuid4()), 'phase': 'starting', 'host': host,
                               'ssh_port': port, 'scope': scope, 'browser': browser,
-                              'identity_file': identity_file,
+                              'identity_file': identity_file, 'clipboard_token': secrets.token_hex(16),
                               'controller': process_record(os.getpid()), 'service_owned': True,
                               'browser_owned': False, 'watcher_owned': False}
                     self.write_connection(values)
@@ -350,7 +372,7 @@ class Controller:
                         raise RuntimeError('The shared SSH master is not ready')
                     values['ssh'] = process_record(int(match.group(1)))
                     self.write_connection(values)
-                subprocess.run(self.channel_command(values, remote_command('prepare', browser=browser), tty=False), check=True)
+                self.prepare(values, browser)
                 with self.lock():
                     if not self.read_connection():
                         raise RuntimeError('Startup was stopped')
@@ -441,6 +463,7 @@ class Controller:
                 raise RuntimeError('Cleanup incomplete; retry stop: ' + '; '.join(errors))
             self.connection_file.unlink(missing_ok=True)
             self.ssh_socket.unlink(missing_ok=True)
+            self.clipboard_socket.unlink(missing_ok=True)
 
     def remove_stale_socket(self):
         try:
@@ -486,6 +509,7 @@ class Controller:
                 time.sleep(0.05)
 
     def watch(self, identifier):
+        server = None
         try:
             while True:
                 with self.lock():
@@ -494,8 +518,13 @@ class Controller:
                         return
                     if not self.connection_ready(values):
                         break
+                    if server is None and values.get('clipboard_token'):
+                        with contextlib.suppress(OSError):  # Image paste is optional; retry next round.
+                            server = clipboard.serve(self.clipboard_socket, values['clipboard_token'])
                 time.sleep(2)
         finally:
+            if server:
+                server.close()
             self.cleanup(identifier)
 
     def status(self):

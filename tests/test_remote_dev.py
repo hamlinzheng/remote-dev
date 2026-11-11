@@ -94,8 +94,19 @@ class CliTests(unittest.TestCase):
         self.assertIn('ForwardAgent=no', args)
         self.assertIn('127.0.0.1:7676:127.0.0.1:7676', args)
         self.assertNotIn('127.0.0.1:9222:127.0.0.1:9222', args)
+        self.assertIn('127.0.0.1:7677:' + str(self.c.clipboard_socket), args)
         value['browser'] = True
         self.assertIn('127.0.0.1:9222:127.0.0.1:9222', self.c.master_command(value))
+
+    def test_prepare_sends_clipboard_token_on_stdin_not_command_line(self):
+        value = self.connection(clipboard_token='secret-token')
+        with patch.object(app.subprocess, 'run') as run:
+            self.c.prepare(value, False)
+        args, kwargs = run.call_args
+        self.assertNotIn('secret-token', ' '.join(args[0]))
+        request = json.loads(kwargs['input'])
+        self.assertEqual(request['token'], 'secret-token')
+        self.assertEqual(request['xclip'], app.clipboard.SHIM)
 
     def test_channels_cannot_fall_back_to_another_connection(self):
         args = self.c.channel_command(self.connection(), 'remote command', tty=True)
@@ -506,14 +517,16 @@ class CliTests(unittest.TestCase):
         result = self.bootstrap(path='/usr/bin:/bin')
         self.assertEqual(result.returncode, 0, result.stderr)
         launched = json.loads((self.home / 'launched.json').read_text())
-        self.assertEqual(launched['path'], str(self.home / '.local/bin') + ':/usr/bin:/bin')
+        self.assertEqual(launched['path'], str(self.home / '.local/share/remote-dev/bin') + ':'
+                         + str(self.home / '.local/bin') + ':/usr/bin:/bin')
         self.assertEqual(os.environ.get('PATH'), parent_path)
 
     def test_remote_claude_preserves_path_when_native_directory_already_present(self):
         existing = '/usr/bin:' + str(self.home / '.local/bin') + ':/bin'
         result = self.bootstrap(path=existing)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads((self.home / 'launched.json').read_text())['path'], existing)
+        self.assertEqual(json.loads((self.home / 'launched.json').read_text())['path'],
+                         str(self.home / '.local/share/remote-dev/bin') + ':' + existing)
 
     def test_same_projects_reuse_remote_directory(self):
         self.assertEqual(self.bootstrap(False).returncode, 0)
@@ -536,6 +549,27 @@ class CliTests(unittest.TestCase):
         instructions.write_text('User-owned instructions\n')
         self.assertNotEqual(self.bootstrap().returncode, 0)
         self.assertEqual(instructions.read_text(), 'User-owned instructions\n')
+
+    def prepare_remote(self, request):
+        (self.home / '.claude.json').write_text(
+            '{"mcpServers":{"local-dev":{"type":"http","url":"http://127.0.0.1:7676/mcp"}}}')
+        (self.home / '.local/bin').mkdir(parents=True, exist_ok=True)
+        (self.home / '.local/bin/claude').touch()
+        payload = {'action': 'prepare', 'paths': [], 'hostname': 'test-local', 'browser': False}
+        return subprocess.run([sys.executable, '-c', app.REMOTE_BOOTSTRAP, json.dumps(payload)],
+            env=dict(os.environ, HOME=str(self.home)), input=request, capture_output=True, text=True)
+
+    def test_remote_prepare_installs_private_clipboard_shim(self):
+        result = self.prepare_remote(json.dumps({'token': 'secret', 'xclip': '#!/bin/sh\n'}))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = self.home / '.local/share/remote-dev'
+        self.assertEqual((data / 'clipboard.token').read_text(), 'secret')
+        self.assertEqual((data / 'bin/xclip').stat().st_mode & 0o777, 0o700)
+        self.assertEqual(data.stat().st_mode & 0o777, 0o700)
+
+    def test_remote_prepare_without_token_installs_nothing(self):
+        self.assertEqual(self.prepare_remote('').returncode, 0)
+        self.assertFalse((self.home / '.local/share/remote-dev/bin').exists())
 
     def test_unrelated_remote_mcp_is_preserved(self):
         config = self.home / '.claude.json'

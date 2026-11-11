@@ -349,6 +349,8 @@ def remote_uninstall(home, data):
         subprocess.run([claude, 'mcp', 'remove', '--scope', 'user', name], check=True, stdout=subprocess.DEVNULL)
     if not modified:
         remove_owned_paths(data, record.get('owned_paths', []))
+        shutil.rmtree(data / 'bin', ignore_errors=True)
+        (data / 'clipboard.token').unlink(missing_ok=True)
         record_path.unlink(missing_ok=True)
     print('Remote uninstall complete. Authentication, history and workspaces were preserved.')
 

@@ -32,6 +32,9 @@ DevSpace handles local files and commands. Chrome DevTools MCP runs remotely and
 | DevSpace MCP | Remote loopback → local DevSpace | `7676` |
 | Browser CDP, with `--browser` | Remote loopback → local Chrome | `9222` |
 | OAuth callback | Local browser → remote client callback | `8765` |
+| Clipboard images | Remote loopback → local clipboard socket | `7677` |
+
+Image paste: `Ctrl+V` in remote Claude runs a remote `xclip` shim that reads images (never text) from the local X11 clipboard through `7677`, authenticated by a per-connection token. Local `xclip` is required. Copying text out uses OSC 52, so use a terminal that supports it (for example WezTerm; GNOME Terminal does not).
 
 ## Requirements
 
@@ -153,11 +156,11 @@ tests/                     isolated regression tests
 | `~/.local/bin/remote-dev` | Symlink to this checkout |
 | `~/.config/remote-dev/devspace/` | Local configuration and owner authentication |
 | `~/.local/share/remote-dev/` | Managed runtimes and installation records; local DevSpace state |
-| `$XDG_RUNTIME_DIR/remote-dev/` | Local connection/session records and SSH socket |
+| `$XDG_RUNTIME_DIR/remote-dev/` | Local connection/session records, SSH and clipboard sockets |
 | `~/.local/state/remote-dev/browser/` | Browser record and logs |
 | `~/.local/share/chrome-agent-dev/` | Local persistent Chrome profile |
 
-Remote contexts live in `~/.local/share/remote-dev/workspaces/<project>-<hash>` or `multi-repo-<hash>` and contain generated instructions. Remote browser dependencies live under `~/.local/share/remote-dev/runtimes/chrome-devtools/`.
+Remote contexts live in `~/.local/share/remote-dev/workspaces/<project>-<hash>` or `multi-repo-<hash>` and contain generated instructions. Remote browser dependencies live under `~/.local/share/remote-dev/runtimes/chrome-devtools/`. The clipboard shim and token live in `~/.local/share/remote-dev/bin/xclip` and `clipboard.token`.
 
 ## Codex compatibility
 
@@ -182,8 +185,8 @@ GitHub Actions checks Python 3.8/3.12, CLI help and locked Node 24 dependency in
 ## TODO
 
 - [ ] Multiple remote targets concurrently.
-- [ ] Selection-based paste.
-- [ ] Direct local clipboard image paste.
+- [x] Selection-based copy: OSC 52 in a supporting terminal, such as WezTerm.
+- [x] Direct local clipboard image paste.
 - [ ] Remote Codex client adapter and acceptance tests.
 
 ## License and acknowledgments
