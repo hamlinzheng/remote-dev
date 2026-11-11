@@ -86,6 +86,10 @@ REMOTE_BOOTSTRAP = r"""
 import hashlib, json, os, pathlib, re, shutil, sys, tempfile
 settings = json.loads(sys.argv[1])
 home = pathlib.Path.home()
+local_bin = str(home / '.local/bin')
+path = os.environ.get('PATH') or os.defpath
+if local_bin not in path.split(os.pathsep):
+    os.environ['PATH'] = local_bin + os.pathsep + path
 claude = home / '.local/bin/claude'
 if not claude.is_file():
     found = shutil.which('claude')

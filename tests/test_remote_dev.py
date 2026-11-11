@@ -483,20 +483,37 @@ class CliTests(unittest.TestCase):
         self.assertTrue(self.c.connection_file.exists())
         self.assertFalse(list(self.c.sessions_dir.glob('*.json')))
 
-    def bootstrap(self, browser=False):
+    def bootstrap(self, browser=False, path=None):
         executable = self.home / '.local/bin/claude'
         executable.parent.mkdir(parents=True, exist_ok=True)
         executable.write_text('#!' + sys.executable + '\nimport pathlib,os,json\n'
             'pathlib.Path(os.environ["HOME"],"launched.json").write_text('
-            'json.dumps({"cwd":str(pathlib.Path.cwd())}))\n')
+            'json.dumps({"cwd":str(pathlib.Path.cwd()),"path":os.environ.get("PATH")}))\n')
         executable.chmod(0o755)
         config = self.home / '.claude.json'
         if not config.exists():
             config.write_text('{"mcpServers":{"local-dev":{"type":"http","url":"http://127.0.0.1:7676/mcp"}}}')
         payload = {'action': 'open', 'paths': ['/tmp/repo space;$(touch SHOULD_NOT_EXIST)'],
                    'hostname': 'test-local', 'browser': browser}
+        environment = dict(os.environ, HOME=str(self.home))
+        if path is not None:
+            environment['PATH'] = path
         return subprocess.run([sys.executable, '-c', app.REMOTE_BOOTSTRAP, json.dumps(payload)],
-            env=dict(os.environ, HOME=str(self.home)), capture_output=True, text=True)
+            env=environment, capture_output=True, text=True)
+
+    def test_remote_claude_inherits_native_install_directory_on_path(self):
+        parent_path = os.environ.get('PATH')
+        result = self.bootstrap(path='/usr/bin:/bin')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        launched = json.loads((self.home / 'launched.json').read_text())
+        self.assertEqual(launched['path'], str(self.home / '.local/bin') + ':/usr/bin:/bin')
+        self.assertEqual(os.environ.get('PATH'), parent_path)
+
+    def test_remote_claude_preserves_path_when_native_directory_already_present(self):
+        existing = '/usr/bin:' + str(self.home / '.local/bin') + ':/bin'
+        result = self.bootstrap(path=existing)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads((self.home / 'launched.json').read_text())['path'], existing)
 
     def test_same_projects_reuse_remote_directory(self):
         self.assertEqual(self.bootstrap(False).returncode, 0)
