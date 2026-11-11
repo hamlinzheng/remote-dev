@@ -1,0 +1,6 @@
+{
+  "name": "remote-dev-devspace-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {"@waishnav/devspace": "1.1.1"}
+}

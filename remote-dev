@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+"""Shared local development access with independent remote Claude sessions."""
+
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import time
+import urllib.request
+import uuid
+
+
+UNIT = 'remote-dev.service'
+WATCH_UNIT = 'remote-dev-link.service'
+MARKER = '# Managed by remote-dev.'
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+from lib.common import atomic_json, private_dir, process_record, ssh_options, validate_host
+from lib.browser import Controller as Browser
+from lib import install as provisioning
+
+
+class BusyError(RuntimeError):
+    pass
+
+
+def canonical_paths(values):
+    roots = set()
+    for value in values:
+        path = Path(value).expanduser().resolve(strict=True)
+        if not path.is_dir():
+            raise ValueError('Workspace root must be a directory: ' + str(path))
+        roots.add(str(path))
+    if not roots:
+        raise ValueError('Configure at least one development directory in workspaces.allowedRoots')
+    return sorted(roots)
+
+
+def require_free_port(port):
+    with socket.socket() as probe:
+        try:
+            probe.bind(('127.0.0.1', port))
+        except OSError as error:
+            raise RuntimeError('Local port %d is occupied; no listener was stopped' % port) from error
+
+
+def same_process(record):
+    return bool(record and process_record(record['pid']) == record)
+
+
+def terminate(record):
+    if not same_process(record):
+        return
+    try:
+        os.kill(record['pid'], signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 3
+    while same_process(record) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if same_process(record):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(record['pid'], signal.SIGKILL)
+
+
+@contextlib.contextmanager
+def defer_signals():
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK,
+                                     {signal.SIGINT, signal.SIGTERM, signal.SIGHUP})
+    try:
+        yield previous
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+REMOTE_BOOTSTRAP = r"""
+import hashlib, json, os, pathlib, re, shutil, sys, tempfile
+settings = json.loads(sys.argv[1])
+home = pathlib.Path.home()
+claude = home / '.local/bin/claude'
+if not claude.is_file():
+    found = shutil.which('claude')
+    if not found: raise SystemExit('Remote Claude executable not found')
+    claude = pathlib.Path(found)
+config_path = home / '.claude.json'
+config = json.loads(config_path.read_text()) if config_path.exists() else {}
+existing = config.get('mcpServers', {}).get('local-dev')
+if existing and (existing.get('type') != 'http' or existing.get('url') != 'http://127.0.0.1:7676/mcp'):
+    raise SystemExit('An unrelated user-scope local-dev MCP exists; not replaced')
+if settings['action'] == 'prepare':
+    if not existing:
+        raise SystemExit('Run remote-dev install --host USER@HOST first; local-dev MCP is missing')
+    if settings['browser'] and not config.get('mcpServers', {}).get('local-chrome'):
+        raise SystemExit('Run remote-dev install --host USER@HOST --browser first')
+    print('Remote Claude and local-dev MCP are ready.', flush=True)
+    raise SystemExit(0)
+if not existing:
+    raise SystemExit('local-dev MCP is missing; stop access and run remote-dev install --host USER@HOST')
+identity = json.dumps({key: settings[key] for key in ['hostname', 'paths']}, sort_keys=True).encode()
+base = home / '.local/share/remote-dev'
+workspaces = base / 'workspaces'
+workspaces.mkdir(parents=True, exist_ok=True, mode=0o700)
+os.chmod(base, 0o700)
+os.chmod(workspaces, 0o700)
+name = pathlib.Path(settings['paths'][0]).name if len(settings['paths']) == 1 else 'multi-repo'
+label = re.sub(r'[^A-Za-z0-9._-]+', '-', name).strip('.-')[:48] or 'workspace'
+directory = workspaces / (label + '-' + hashlib.sha256(identity).hexdigest()[:16])
+directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+instructions = directory / 'CLAUDE.md'
+header = '# Managed by remote-dev.\n'
+text = header + '\nLocal repositories:\n' + ''.join('- ' + json.dumps(path) + '\n' for path in settings['paths'])
+text += '''\nUse local-dev MCP for local files, Git, Shell and existing project Docker/build commands. Native Claude tools run on this remote server. Open the selected repositories separately and read their instructions first. Other Claude sessions may share this checkout: coordinate edits and serialize builds using the same outputs. Do not start ROS, replay or business services without an explicit request. Exiting this Claude leaves shared access enabled; remote-dev stop closes it.\n'''
+text += '\nUse local-chrome for the dedicated local browser; coordinate shared pages.\n' if settings['browser'] else '\nBrowser forwarding is disabled.\n'
+previous = instructions.read_text() if instructions.exists() else None
+if previous is not None and not previous.startswith(header):
+    raise SystemExit('Remote instructions are user-owned; not replaced')
+if previous != text:
+    with tempfile.NamedTemporaryFile('w', dir=directory, delete=False) as stream:
+        stream.write(text)
+    os.replace(stream.name, instructions)
+os.chdir(directory)
+os.execv(str(claude), [str(claude)])
+"""
+
+
+def remote_command(action, paths=None, browser=False):
+    payload = json.dumps({'action': action, 'paths': paths or [],
+                         'hostname': socket.gethostname(), 'browser': browser}, sort_keys=True)
+    return shlex.join(['python3', '-c', REMOTE_BOOTSTRAP, payload])
+
+
+def within(path, base):
+    try:
+        Path(path).relative_to(Path(base).expanduser().resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def reap(child):
+    if child is not None and child.poll() is None:
+        child.terminate()
+        try:
+            child.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+
+
+class Controller:
+    def __init__(self, home=None, runtime_dir=None):
+        self.home = Path(home or Path.home())
+        self.data = self.home / '.local/share/remote-dev'
+        self.config_dir = self.home / '.config/remote-dev/devspace'
+        self.config_file = self.config_dir / 'config.jsonc'
+        self.unit_file = self.home / '.config/systemd/user' / UNIT
+        self.runtime = Path(runtime_dir or Path(os.environ.get('XDG_RUNTIME_DIR',
+                              '/run/user/' + str(os.getuid()))))
+        if runtime_dir is None:
+            self.runtime = self.runtime / 'remote-dev'
+        self.connection_file = self.runtime / 'connection.json'
+        self.sessions_dir = self.runtime / 'sessions'
+        self.ssh_socket = self.runtime / 'ssh.sock'
+        self.browser = Browser(self.home)
+
+    @contextlib.contextmanager
+    def lock(self, name='control.lock', nonblocking=False):
+        private_dir(self.runtime)
+        with (self.runtime / name).open('a') as stream:
+            os.chmod(stream.name, 0o600)
+            try:
+                fcntl.flock(stream, fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0))
+            except BlockingIOError as error:
+                raise BusyError('Another remote-dev operation is starting; inspect status before retrying') from error
+            yield
+
+    def read_connection(self):
+        try:
+            return json.loads(self.connection_file.read_text())
+        except FileNotFoundError:
+            return None
+
+    def write_connection(self, value):
+        atomic_json(self.connection_file, value)
+
+    def read_config(self):
+        try:
+            return json.loads(self.config_file.read_text())
+        except json.JSONDecodeError as error:
+            raise ValueError('DevSpace configuration must be strict JSON (no comments or trailing commas): '
+                             + str(self.config_file)) from error
+
+    def systemctl(self, *args, check=True, unit=UNIT):
+        return subprocess.run(['systemctl', '--user', *args, *([] if args[0] == 'daemon-reload' else [unit])],
+                              check=check, capture_output=True, text=True)
+
+    def service_active(self):
+        return self.systemctl('is-active', check=False).returncode == 0
+
+    def install(self, host=None, port=22, identity_file=None, browser=False, install_node=False):
+        return provisioning.install(self, ROOT, host, port, identity_file, browser, install_node)
+
+    def uninstall(self, host=None, port=22, identity_file=None):
+        self.stop()
+        return provisioning.uninstall(self, ROOT, host, port, identity_file)
+
+    def master_command(self, values):
+        args = ['ssh', '-M', '-S', str(self.ssh_socket), '-fNT',
+                '-o', 'ControlPersist=no',
+                '-o', 'ExitOnForwardFailure=yes',
+                '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2',
+                '-R', '127.0.0.1:7676:127.0.0.1:7676',
+                '-L', '127.0.0.1:8765:127.0.0.1:8765']
+        if values['browser']:
+            args += ['-R', '127.0.0.1:9222:127.0.0.1:9222']
+        args += ssh_options(values['ssh_port'], values.get('identity_file'))
+        return args + [values['host']]
+
+    def channel_command(self, values, command, tty=True):
+        return ['ssh', '-t' if tty else '-T', '-S', str(self.ssh_socket),
+                '-p', str(values['ssh_port']), '-o', 'ControlMaster=no',
+                '-o', 'ProxyCommand=false', '-o', 'BatchMode=yes',
+                '-o', 'ForwardAgent=no', values['host'], command]
+
+    def control(self, values, action):
+        return subprocess.run(['ssh', '-S', str(self.ssh_socket), '-O', action,
+            '-p', str(values['ssh_port']), '-o', 'BatchMode=yes', values['host']],
+            capture_output=True, text=True, timeout=5)
+
+    def connection_ready(self, values):
+        return (values.get('phase') == 'ready' and self.service_active()
+                and self.control(values, 'check').returncode == 0)
+
+    def wait_health(self):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                with opener.open('http://127.0.0.1:7676/healthz', timeout=1) as response:
+                    if json.load(response).get('name') == 'devspace':
+                        return
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.2)
+        raise RuntimeError('DevSpace did not become healthy; inspect journalctl --user -u ' + UNIT)
+
+    def start(self, host, port, browser, identity_file=None):
+        validate_host(host)
+        ssh_options(port, identity_file)
+        identity_file = str(Path(identity_file).expanduser().resolve()) if identity_file else None
+        with self.lock('startup.lock', nonblocking=True):
+            values, child, started = None, None, False
+            try:
+                with self.lock():
+                    existing = self.read_connection()
+                    if existing:
+                        current = (existing['host'], existing['ssh_port'], existing['browser'],
+                                   existing.get('identity_file'))
+                        if current == (host, port, browser, identity_file) and self.connection_ready(existing):
+                            print('Shared connection is already running.')
+                            return
+                        raise RuntimeError('A connection is recorded; inspect status and run stop before changing it')
+                    if self.service_active() or self.ssh_socket.exists():
+                        raise RuntimeError('Untracked access exists; inspect status and run stop first')
+                    if not self.config_file.exists():
+                        raise RuntimeError('Run remote-dev install first')
+                    config = self.read_config()
+                    scope = canonical_paths(config.get('workspaces', {}).get('allowedRoots', []))
+                    require_free_port(7676)
+                    require_free_port(8765)
+                    values = {'id': str(uuid.uuid4()), 'phase': 'starting', 'host': host,
+                              'ssh_port': port, 'scope': scope, 'browser': browser,
+                              'identity_file': identity_file,
+                              'controller': process_record(os.getpid()), 'service_owned': True,
+                              'browser_owned': False, 'watcher_owned': False}
+                    self.write_connection(values)
+                    self.systemctl('start')
+                    self.wait_health()
+                    if browser:
+                        with defer_signals():
+                            acquired = self.browser.start()
+                            values['browser_owned'] = acquired['created_browser']
+                            values['browser_stamp'] = acquired['session_stamp']
+                            self.write_connection(values)
+                    print('Host DevSpace ready. Connecting to ' + host + '.', flush=True)
+                    with defer_signals() as previous_mask:
+                        child = subprocess.Popen(self.master_command(values),
+                            preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask))
+                        values['ssh'] = process_record(child.pid)
+                        self.write_connection(values)
+                if child.wait() != 0:
+                    raise RuntimeError('SSH startup failed; check authentication and forwarding ports')
+                with self.lock():
+                    if not self.read_connection():
+                        raise RuntimeError('Startup was stopped')
+                    check = self.control(values, 'check')
+                    match = re.search(r'pid=(\d+)', check.stdout + check.stderr)
+                    if check.returncode or not match:
+                        raise RuntimeError('The shared SSH master is not ready')
+                    values['ssh'] = process_record(int(match.group(1)))
+                    self.write_connection(values)
+                subprocess.run(self.channel_command(values, remote_command('prepare', browser=browser), tty=False), check=True)
+                with self.lock():
+                    if not self.read_connection():
+                        raise RuntimeError('Startup was stopped')
+                    values['phase'] = 'ready'
+                    values['controller'] = None
+                    self.write_connection(values)
+                    with defer_signals():
+                        subprocess.run(['systemd-run', '--user', '--quiet', '--collect',
+                            '--unit=' + WATCH_UNIT, '--property=Restart=no',
+                            '--property=KillMode=control-group', '--property=TimeoutStopSec=10',
+                            sys.executable, str(Path(__file__).resolve()), '_watch', values['id']], check=True)
+                        values['watcher_owned'] = True
+                        self.write_connection(values)
+                started = True
+                print('Shared connection ready. Run remote-dev open in any project terminal.')
+            finally:
+                reap(child)
+                if values and not started:
+                    self.cleanup(values['id'], acquired=values)
+                    if values.get('watcher_owned'):
+                        self.systemctl('stop', unit=WATCH_UNIT, check=False)
+
+    def open(self, paths, client='claude'):
+        if client != 'claude':
+            raise ValueError('Codex is planned; only Claude is implemented')
+        paths = canonical_paths(paths or [Path.cwd()])
+        identifier, child = str(uuid.uuid4()), None
+        try:
+            with self.lock():
+                values = self.read_connection()
+                if not values or not self.connection_ready(values):
+                    raise RuntimeError('Run remote-dev start --host USER@HOST first')
+                for path in paths:
+                    if not any(within(path, base) for base in values['scope']):
+                        raise ValueError('Path is outside configured development roots: ' + path +
+                                         '; edit ' + str(self.config_file) + ' while stopped, then start again')
+                command = remote_command('open', paths, values['browser'])
+                with defer_signals() as previous_mask:
+                    child = subprocess.Popen(self.channel_command(values, command),
+                        preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask))
+                    atomic_json(self.sessions_dir / (identifier + '.json'), {
+                        'id': identifier, 'client': client, 'paths': paths,
+                        'ssh': process_record(child.pid)})
+            print('Claude session ' + identifier[:8] + ': ' + ', '.join(paths), flush=True)
+            return child.wait()
+        finally:
+            reap(child)
+            with self.lock():
+                (self.sessions_dir / (identifier + '.json')).unlink(missing_ok=True)
+
+    def sessions(self):
+        records = []
+        for path in sorted(self.sessions_dir.glob('*.json')):
+            try:
+                records.append((path, json.loads(path.read_text())))
+            except FileNotFoundError:
+                pass
+        return records
+
+    def cleanup(self, identifier, acquired=None):
+        with self.lock():
+            values = self.read_connection()
+            if acquired and (not values or values.get('id') == identifier):
+                values = acquired
+            if not values or values.get('id') != identifier:
+                return
+            errors = []
+            try:
+                if self.ssh_socket.exists():
+                    self.control(values, 'exit')
+                terminate(values.get('ssh'))
+                for path, session in self.sessions():
+                    terminate(session.get('ssh'))
+                    path.unlink(missing_ok=True)
+            except (OSError, subprocess.SubprocessError) as error:
+                errors.append(str(error))
+            if values.get('service_owned'):
+                try:
+                    self.systemctl('stop')
+                except subprocess.SubprocessError as error:
+                    errors.append(str(error))
+            if values.get('browser_owned'):
+                try:
+                    self.browser.stop(expected_stamp=values['browser_stamp'])
+                except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                    errors.append(str(error))
+            if errors:
+                raise RuntimeError('Cleanup incomplete; retry stop: ' + '; '.join(errors))
+            self.connection_file.unlink(missing_ok=True)
+            self.ssh_socket.unlink(missing_ok=True)
+
+    def remove_stale_socket(self):
+        try:
+            mode = self.ssh_socket.lstat().st_mode
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(mode):
+            raise RuntimeError('Unexpected file at SSH control socket path; inspect ' + str(self.ssh_socket))
+        with socket.socket(socket.AF_UNIX) as probe:
+            probe.settimeout(1)
+            try:
+                probe.connect(str(self.ssh_socket))
+            except ConnectionRefusedError:
+                self.ssh_socket.unlink(missing_ok=True)
+                return
+            except FileNotFoundError:
+                return
+        raise RuntimeError('Untracked SSH control socket is active; inspect ' + str(self.ssh_socket))
+
+    def stop(self):
+        while True:
+            with self.lock():
+                values = self.read_connection()
+                if values and values.get('phase') == 'starting' and same_process(values.get('controller')):
+                    if values['controller']['pid'] != os.getpid():
+                        os.kill(values['controller']['pid'], signal.SIGTERM)
+            try:
+                with self.lock('startup.lock', nonblocking=True):
+                    values = self.read_connection()
+                    if values:
+                        self.cleanup(values['id'])
+                        if values.get('watcher_owned'):
+                            self.systemctl('stop', unit=WATCH_UNIT, check=False)
+                    else:
+                        self.remove_stale_socket()
+                        if self.service_active():
+                            if not self.unit_file.read_text().startswith(MARKER):
+                                raise RuntimeError('The service unit is not managed by remote-dev')
+                            self.systemctl('stop')
+                    print('Stopped. Authentication, profiles and project workloads are preserved.')
+                    return
+            except BusyError:
+                time.sleep(0.05)
+
+    def watch(self, identifier):
+        try:
+            while True:
+                with self.lock():
+                    values = self.read_connection()
+                    if not values or values['id'] != identifier:
+                        return
+                    if not self.connection_ready(values):
+                        break
+                time.sleep(2)
+        finally:
+            self.cleanup(identifier)
+
+    def status(self):
+        values = self.read_connection()
+        service = self.service_active()
+        ssh = bool(values and self.control(values, 'check').returncode == 0)
+        browser = False
+        if values and values.get('browser'):
+            browser = self.browser.status()['chrome_running']
+        sessions = [{'id': record['id'], 'client': record['client'], 'paths': record['paths'],
+                     'running': same_process(record.get('ssh'))} for _, record in self.sessions()]
+        return {'running': bool(values and values.get('phase') == 'ready' and service and ssh),
+                'service_running': service, 'ssh_running': ssh,
+                'browser_requested': bool(values and values.get('browser')),
+                'browser_running': browser, 'host': values.get('host') if values else None,
+                'development_roots': values.get('scope', []) if values else [],
+                'sessions': sessions, 'active_sessions': sum(item['running'] for item in sessions),
+                'authentication': 'Check local-dev in Claude /mcp; not inferred from health.'}
+
+
+def parser():
+    result = argparse.ArgumentParser(description=__doc__)
+    commands = result.add_subparsers(dest='command', required=True)
+    prepared = commands.add_parser('install', help='Install local dependencies and configure an optional remote server')
+    removed = commands.add_parser('uninstall', help='Remove owned installation resources, preserving user data')
+    start = commands.add_parser('start', help='Start shared access without launching Claude')
+    start.add_argument('--host', required=True, help='Explicit SSH target: [USER@]HOST')
+    start.add_argument('--ssh-port', type=int, default=22)
+    start.add_argument('--browser', action='store_true', help='Start or borrow dedicated local Chrome')
+    for command in [prepared, removed]:
+        command.add_argument('--host', help='Optional remote SSH target: [USER@]HOST')
+        command.add_argument('--ssh-port', type=int, default=22)
+    for command in [prepared, start, removed]:
+        command.add_argument('-i', '--identity-file', help='Local SSH private key; never copied remotely')
+    prepared.add_argument('--browser', action='store_true', help='Prepare local Chrome and remote browser MCP')
+    prepared.add_argument('--with-node', dest='install_node', action='store_true', help='Install private Node24 if no compatible runtime exists')
+    opened = commands.add_parser('open', help='Open an independent Claude session; default directory is cwd')
+    opened.add_argument('paths', nargs='*', help='Local repository directories')
+    opened.add_argument('--client', choices=['claude'], default='claude', help='Default: claude; Codex is planned')
+    status = commands.add_parser('status', help='Inspect shared access and individual sessions')
+    status.add_argument('--json', action='store_true')
+    commands.add_parser('stop', help='Close shared access and all managed sessions')
+    return result
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    controller = Controller()
+    def interrupted(_number, _frame):
+        raise KeyboardInterrupt
+    previous = {number: signal.signal(number, interrupted)
+                for number in [signal.SIGTERM, signal.SIGHUP]}
+    try:
+        if argv[:1] == ['_watch']:
+            controller.watch(argv[1])
+            return 0
+        args = parser().parse_args(argv)
+        if args.command == 'install':
+            controller.install(args.host, args.ssh_port, args.identity_file, args.browser, args.install_node)
+        elif args.command == 'start':
+            controller.start(args.host, args.ssh_port, args.browser, args.identity_file)
+        elif args.command == 'uninstall':
+            controller.uninstall(args.host, args.ssh_port, args.identity_file)
+        elif args.command == 'open':
+            return controller.open(args.paths, args.client)
+        elif args.command == 'stop':
+            controller.stop()
+        else:
+            status = controller.status()
+            if args.json:
+                print(json.dumps(status, indent=2))
+            else:
+                print('Connection: ' + ('running' if status['running'] else 'stopped or partial'))
+                print('Host: ' + str(status['host']))
+                for item in status['sessions']:
+                    print('%s %s %s: %s' % (item['id'][:8], item['client'],
+                        'running' if item['running'] else 'stale', ', '.join(item['paths'])))
+                print('Active sessions: ' + str(status['active_sessions']))
+            return 0 if status['running'] else 1
+        return 0
+    except KeyboardInterrupt:
+        print('\nInterrupted.', file=sys.stderr)
+        return 130
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print('Error: ' + str(error), file=sys.stderr)
+        return 2
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

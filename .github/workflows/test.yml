@@ -1,0 +1,29 @@
+name: checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python: ['3.8', '3.12']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - run: PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v
+      - run: ./remote-dev --help
+  dependencies:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        runtime: [devspace, chrome-devtools]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - run: npm ci --omit=dev --no-audit --no-fund
+        working-directory: runtimes/${{ matrix.runtime }}
