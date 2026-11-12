@@ -163,6 +163,16 @@ def within(path, base):
         return False
 
 
+# Undo modes a remote TUI may leave on when its channel drops: mouse, focus, paste, keyboard, alt screen.
+TERMINAL_RESET = '\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?1004l\033[?2004l\033[<u\033[?1049l\033[?25h'
+
+
+def restore_terminal():
+    if sys.stdout.isatty():
+        sys.stdout.write(TERMINAL_RESET)
+        sys.stdout.flush()
+
+
 def reap(child):
     if child is not None and child.poll() is None:
         child.terminate()
@@ -417,7 +427,10 @@ class Controller:
                         'id': identifier, 'client': client, 'paths': paths,
                         'ssh': process_record(child.pid)})
             print('Claude session ' + identifier[:8] + ': ' + ', '.join(paths), flush=True)
-            return child.wait()
+            code = child.wait()
+            if code == 255:
+                restore_terminal()
+            return code
         finally:
             reap(child)
             with self.lock():

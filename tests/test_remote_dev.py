@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -163,6 +164,19 @@ class CliTests(unittest.TestCase):
         self.assertEqual(command[0]['paths'], [str(self.home)])
         self.assertEqual(self.c.read_connection()['id'], 'bridge')
         self.assertEqual(list(self.c.sessions_dir.glob('*.json')), [])
+
+    def test_open_restores_terminal_only_after_dropped_channel(self):
+        self.connection()
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+        for code in (255, 0, 1):
+            out = Tty()
+            with patch.object(self.c, 'connection_ready', return_value=True), \
+                    patch.object(self.c, 'channel_command', return_value=['/bin/sh', '-c', 'exit %d' % code]), \
+                    patch.object(app.sys, 'stdout', out):
+                self.assertEqual(self.c.open([str(self.home)]), code)
+            self.assertEqual(out.getvalue().endswith(app.TERMINAL_RESET), code == 255)
 
     def test_open_outside_scope_does_not_restart_or_expand_service(self):
         self.connection(scope=[str(self.home / 'inside')])
