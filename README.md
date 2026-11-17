@@ -47,7 +47,7 @@ Image paste: `Ctrl+V` in remote Claude runs a remote `xclip` shim that reads ima
 | Terminal | OSC 52 clipboard support to copy Claude output, such as WezTerm or kitty; VTE terminals (GNOME Terminal, Terminator) ignore it | Not required |
 | Clipboard | X11 and `xclip` (`sudo apt install xclip`), only for image paste | Not required |
 
-`--with-node` permits a private Node 24.22.2 download for Linux x64/arm64 when no compatible runtime exists. The archive is checked against official SHA256 checksums. Existing compatible Node is reused; other prerequisites remain user-managed. No sudo or shell/account changes are required.
+`--with-node` permits a private Node 24.22.2 download for Linux x64/arm64 when no compatible runtime exists. The archive is checked against official SHA256 checksums. Existing compatible Node is reused, including per-user installs (`~/.local/share/node-*`, nvm, volta, `~/.local/bin`) that a non-interactive SSH shell does not put on PATH; other prerequisites remain user-managed. No sudo or shell/account changes are required.
 
 The pinned browser MCP supports Node `^20.19.0 || ^22.12.0 || >=23`. Remote installation reuses a compatible runtime.
 

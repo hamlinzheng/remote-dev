@@ -27,9 +27,16 @@ def read_json(path):
         return {}
 
 
-def find_node(data, install_node=False, previous=None, browser=False):
+# Per-user Node installs that a non-interactive SSH shell does not put on PATH.
+USER_NODE = ['.local/share/node-*/bin/node', '.local/node-*/bin/node', '.nvm/versions/node/*/bin/node',
+             '.volta/bin/node', '.local/bin/node']
+
+
+def find_node(data, install_node=False, previous=None, browser=False, home=None):
     candidates = [previous, shutil.which('node')]
     candidates += sorted((data / 'node').glob('node-*/bin/node'), reverse=True)
+    for pattern in USER_NODE if home else []:
+        candidates += sorted(home.glob(pattern), reverse=True)
     for candidate in candidates:
         if not candidate or not Path(candidate).is_file():
             continue
@@ -159,7 +166,7 @@ def local_install(app, root, browser=False, install_node=False):
     if browser and not shutil.which('google-chrome'):
         raise RuntimeError('Install google-chrome on the local desktop before browser install')
     config = app.read_config() if app.config_file.exists() else None
-    node = find_node(app.data, install_node, previous.get('node'))
+    node = find_node(app.data, install_node, previous.get('node'), home=app.home)
     runtime = install_runtime(root / 'runtimes/devspace', app.data / 'runtimes/devspace', node)
     executable = runtime / 'node_modules/@waishnav/devspace/bin/devspace.js'
     text = unit_text(app.home, node, executable, app.config_dir)
@@ -296,7 +303,7 @@ def remote_install(options):
         if not dev:
             desired['local-dev'] = {'type': 'http', 'url': 'http://127.0.0.1:7676/mcp'}
         if options['browser']:
-            node = find_node(data, options['install_node'], node, browser=True)
+            node = find_node(data, options['install_node'], node, browser=True, home=home)
             runtime = install_runtime(ROOT / 'runtimes/chrome-devtools', data / 'runtimes/chrome-devtools', node)
             entry = runtime / 'node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js'
             desired['local-chrome'] = {'type': 'stdio', 'command': str(node),

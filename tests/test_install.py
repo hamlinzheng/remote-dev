@@ -104,6 +104,24 @@ class InstallationTests(unittest.TestCase):
                     with self.assertRaises(RuntimeError):
                         install.find_node(self.home / 'app', browser=True)
 
+    def test_user_installed_node_outside_ssh_path_is_found(self):
+        def fake(relative):
+            binary = self.home / relative
+            binary.parent.mkdir(parents=True)
+            binary.touch()
+            (binary.parent / 'npm').touch()
+            return binary
+        tarball = fake('.local/share/node-v24.22.3-linux-arm64/bin/node')
+        nvm = fake('.nvm/versions/node/v22.12.0/bin/node')
+        versions = {str(tarball): 'v24.22.3', str(nvm): 'v22.12.0'}
+        with patch.object(install.shutil, 'which', return_value=None), \
+                patch.object(install.subprocess, 'check_output', side_effect=lambda args, **k: versions[args[0]]):
+            self.assertEqual(install.find_node(self.home / 'app', browser=True, home=self.home), tarball)
+            tarball.unlink()
+            self.assertEqual(install.find_node(self.home / 'app', browser=True, home=self.home), nvm)
+            with self.assertRaises(RuntimeError, msg='without home only PATH and private installs are searched'):
+                install.find_node(self.home / 'app', browser=True)
+
     def test_local_devspace_still_rejects_node20(self):
         binary = self.home / 'bin/node'
         binary.parent.mkdir()
