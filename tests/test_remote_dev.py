@@ -179,18 +179,57 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.c.read_connection(self.key)['id'], 'bridge')
         self.assertEqual(list(self.c.sessions_dir.glob('*.json')), [])
 
-    def test_open_restores_terminal_only_after_dropped_channel(self):
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    def open_with_exit(self, command, out):
+        with patch.object(self.c, 'connection_ready', return_value=True), \
+                patch.object(self.c, 'channel_command', return_value=['/bin/sh', '-c', command]), \
+                patch.object(app.sys, 'stdout', out):
+            return self.c.open([str(self.home)])
+
+    def test_open_always_restores_terminal_modes_after_the_channel(self):
         self.connection()
-        class Tty(io.StringIO):
-            def isatty(self):
-                return True
-        for code in (255, 0, 1):
-            out = Tty()
-            with patch.object(self.c, 'connection_ready', return_value=True), \
-                    patch.object(self.c, 'channel_command', return_value=['/bin/sh', '-c', 'exit %d' % code]), \
-                    patch.object(app.sys, 'stdout', out):
-                self.assertEqual(self.c.open([str(self.home)]), code)
-            self.assertEqual(out.getvalue().endswith(app.TERMINAL_RESET), code == 255)
+        for command, code in [('exit 0', 0), ('exit 1', 1), ('exit 255', 255), ('kill -9 $$', -9)]:
+            out = self.Tty()
+            self.assertEqual(self.open_with_exit(command, out), code)
+            written = out.getvalue()
+            self.assertTrue(written.endswith(app.TERMINAL_MODES), command)
+            self.assertIn(app.KEYBOARD_RESET, written)
+            # Only an unclean end may have left the alternate screen; a clean exit keeps the cursor position.
+            self.assertEqual(app.ALTERNATE_SCREEN_EXIT in written, code != 0, command)
+            if code:
+                self.assertLess(written.index(app.ALTERNATE_SCREEN_EXIT), written.index(app.KEYBOARD_RESET),
+                                'leave the alternate screen before popping the main-screen keyboard stack')
+
+    def test_open_restores_terminal_when_interrupted(self):
+        self.connection()
+        out = self.Tty()
+        real_wait = subprocess.Popen.wait
+        def wait(process, timeout=None):
+            if timeout is None:
+                raise KeyboardInterrupt  # SIGTERM/SIGHUP are mapped to this while Claude runs
+            return real_wait(process, timeout)
+        with patch.object(self.c, 'connection_ready', return_value=True), \
+                patch.object(self.c, 'channel_command', return_value=['/bin/sleep', '30']), \
+                patch.object(app.sys, 'stdout', out), \
+                patch.object(subprocess.Popen, 'wait', wait):
+            with self.assertRaises(KeyboardInterrupt):
+                self.c.open([str(self.home)])
+        self.assertIn(app.ALTERNATE_SCREEN_EXIT, out.getvalue())
+        self.assertTrue(out.getvalue().endswith(app.TERMINAL_MODES))
+
+    def test_open_writes_no_escape_codes_without_a_terminal(self):
+        self.connection()
+        out = io.StringIO()
+        self.assertEqual(self.open_with_exit('exit 255', out), 255)
+        self.assertNotIn('\033', out.getvalue())
+
+    def test_terminal_reset_covers_common_tui_modes(self):
+        for mode in ['1', '25h', '1000', '1002', '1003', '1004', '1005', '1006', '1015', '2004', '2026']:
+            self.assertIn('\033[?' + mode, app.TERMINAL_MODES)
+        self.assertNotIn('1049', app.TERMINAL_MODES)
 
     def test_open_outside_scope_does_not_restart_or_expand_service(self):
         self.connection(scope=[str(self.home / 'inside')])

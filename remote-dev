@@ -168,13 +168,21 @@ def within(path, base):
         return False
 
 
-# Undo modes a remote TUI may leave on when its channel drops: mouse, focus, paste, keyboard, alt screen.
-TERMINAL_RESET = '\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?1004l\033[?2004l\033[<u\033[?1049l\033[?25h'
+# Modes a remote TUI may leave on when its channel ends: cursor keys, mouse tracking and encodings,
+# focus, bracketed paste, synchronized output; finally show the cursor.
+TERMINAL_MODES = ('\033[?1l\033[?1000l\033[?1002l\033[?1003l\033[?1005l\033[?1006l\033[?1015l'
+                  '\033[?1004l\033[?2004l\033[?2026l\033[?25h')
+ALTERNATE_SCREEN_EXIT = '\033[?1049l'
+KEYBOARD_RESET = '\033[<99u'  # pop every kitty keyboard flag entry of the current screen
 
 
-def restore_terminal():
-    if sys.stdout.isatty():
-        sys.stdout.write(TERMINAL_RESET)
+def restore_terminal(clean):
+    """Idempotent reset after a Claude channel; leaving the alternate screen first moves the cursor, so skip it
+    when Claude exited cleanly and restored the screen itself."""
+    if not sys.stdout.isatty():
+        return
+    with contextlib.suppress(OSError, ValueError):
+        sys.stdout.write(('' if clean else ALTERNATE_SCREEN_EXIT) + KEYBOARD_RESET + TERMINAL_MODES)
         sys.stdout.flush()
 
 
@@ -619,7 +627,7 @@ class Controller:
         if client != 'claude':
             raise ValueError('Codex is planned; only Claude is implemented')
         paths = canonical_paths(paths or [Path.cwd()])
-        identifier, child = str(uuid.uuid4()), None
+        identifier, child, code = str(uuid.uuid4()), None, None
         try:
             with self.lock():
                 values = self.resolve_active(host)
@@ -638,11 +646,11 @@ class Controller:
                         'ssh': process_record(child.pid)})
             print('Claude session %s on %s: %s' % (identifier[:8], describe(values), ', '.join(paths)), flush=True)
             code = child.wait()
-            if code == 255:
-                restore_terminal()
             return code
         finally:
             reap(child)
+            if child is not None:
+                restore_terminal(clean=code == 0)
             with self.lock():
                 (self.sessions_dir / (identifier + '.json')).unlink(missing_ok=True)
 
