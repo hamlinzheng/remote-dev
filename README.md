@@ -81,7 +81,7 @@ remote-dev stop
 | `open [-H TARGET] [PATH ...]` | Open a Claude session |
 | `status [-H TARGET] [--json]` | Inspect access, browser and sessions of all or one connection |
 | `stop [-H TARGET \| --all]` | Close a connection with its sessions, or all of them |
-| `auth [-H TARGET]` | Move the local OAuth callback port `8765` to a connection |
+| `auth [-H TARGET]` | Move the local OAuth callback port `8765` to a connection; `open` does this automatically |
 | `uninstall [-H TARGET]` | Remove owned local and optional remote installation resources; forgets the target |
 | `-i`, `--identity-file` | Local SSH private key, for install/start/uninstall |
 | `--ssh-port PORT` | SSH port for install/start/uninstall; default `22` or the remembered port |
@@ -101,7 +101,7 @@ remote-dev start -H nex
 remote-dev open -H aws                 # several connections: choose one
 export REMOTE_DEV_HOST=nex             # or fix this terminal to one server
 remote-dev open
-remote-dev auth -H nex                 # before the first local-dev login on that server
+remote-dev auth -H nex                 # only if a login callback fails; open moves it already
 remote-dev stop -H aws                 # nexcom23 keeps running; stop --all closes both
 remote-dev start -H aws                # later: the remembered port and key are reused
 ```
@@ -142,7 +142,7 @@ Pass `--ssh-port` for a non-default port.
 
 Native Claude tools run remotely. Use **local-dev** for local files, Git, Shell and project build commands; use **local-chrome** for the local browser.
 
-For the first local-dev login, open `/mcp` in remote Claude. Open its authorization URL locally and enter the `ownerToken` from `~/.config/remote-dev/devspace/auth.json`. Keep this value private. Callback port `8765` is forwarded to the first connection; with several servers, run `remote-dev auth -H TARGET` before logging in on another one. Authorize initial sessions one at a time. Browser MCP needs no separate AI-account login.
+For the first local-dev login, open `/mcp` in remote Claude. Open its authorization URL locally and enter the `ownerToken` from `~/.config/remote-dev/devspace/auth.json`. Keep this value private. Callback port `8765` follows the connection of the latest `open`, so a login right after `open` completes without extra steps; if another server took it meanwhile, run `remote-dev auth -H TARGET`. Authorize initial sessions one at a time. Browser MCP needs no separate AI-account login.
 
 Alternatively, run on the remote server:
 

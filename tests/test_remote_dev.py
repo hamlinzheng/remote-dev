@@ -27,6 +27,9 @@ class CliTests(unittest.TestCase):
         self.c = app.Controller(self.home, self.home / 'run')
         self.key = app.target_key('user@host', 22)
         self.p = self.c.paths(self.key)
+        self.move_patch = patch.object(self.c, 'move_oauth', return_value=False)
+        self.move_patch.start()
+        self.addCleanup(patch.stopall)
 
     def connection(self, **overrides):
         value = {'id': 'bridge', 'phase': 'ready', 'host': 'user@host', 'ssh_port': 22,
@@ -729,7 +732,7 @@ class CliTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'Untracked'):
                 self.c.start('user@host', 22, False)
 
-    def test_successful_start_forwards_oauth_once_and_remembers_target(self):
+    def test_successful_start_leaves_oauth_to_open_and_remembers_target(self):
         self.start_fixture()
         actions, master = [], self.child()
         def control(values, action, *args):
@@ -745,25 +748,44 @@ class CliTests(unittest.TestCase):
                 patch.object(app, 'require_free_port'), \
                 patch.object(app.subprocess, 'run', side_effect=run):
             self.c.start('user@host', 22, False)
-        self.assertIn(('user@host', 'forward') + app.OAUTH_FORWARD, actions)
-        self.assertEqual(self.c.read_shared(), {'devspace_owned': True, 'oauth_holder': self.key})
+        self.assertNotIn(('user@host', 'forward') + app.OAUTH_FORWARD, actions)
+        self.assertEqual(self.c.read_shared(), {'devspace_owned': True})
         value = self.c.read_connection(self.key)
         self.assertEqual((value['phase'], value['watcher_owned']), ('ready', True))
         self.assertEqual(self.c.read_targets()[0]['host'], 'user@host')
 
-    def test_oauth_forward_is_best_effort(self):
+    def test_open_moves_oauth_callback_to_its_connection(self):
+        self.move_patch.stop()
         a, b = self.two_connections()
         self.c.write_shared({'oauth_holder': self.key})
-        with patch.object(self.c, 'control', side_effect=AssertionError('forward attempted')):
-            self.c.forward_oauth(b)
-        self.c.write_shared({})
-        with patch.object(self.c, 'control', return_value=subprocess.CompletedProcess([], 1, '', 'in use')), \
+        actions = []
+        def control(values, action, *args):
+            actions.append((values['host'], action))
+            return subprocess.CompletedProcess([], 0, '', '')
+        with patch.object(self.c, 'connection_ready', return_value=True), \
+                patch.object(self.c, 'channel_command', return_value=['/bin/true']), \
+                patch.object(self.c, 'control', side_effect=control), \
+                patch.object(app.sys, 'stdout', io.StringIO()) as out:
+            self.assertEqual(self.c.open([str(self.home)], host='nex'), 0)
+            self.assertEqual(actions, [('user@host', 'cancel'), ('me@nexcom23', 'forward')])
+            self.assertIn('OAuth callback 8765 now forwards to me@nexcom23:22', out.getvalue())
+            self.c.open([str(self.home)], host='nex')
+        self.assertEqual(len(actions), 2, 'the holder keeps the callback without ssh calls')
+        self.assertEqual(self.c.read_shared(), {'oauth_holder': b['key']})
+
+    def test_open_runs_even_if_the_callback_cannot_move(self):
+        self.move_patch.stop()
+        self.connection()
+        with patch.object(self.c, 'connection_ready', return_value=True), \
+                patch.object(self.c, 'channel_command', return_value=['/bin/true']), \
+                patch.object(self.c, 'control', return_value=subprocess.CompletedProcess([], 1, '', 'in use')), \
                 patch.object(app.sys, 'stderr', io.StringIO()) as err:
-            self.c.forward_oauth(b)
-        self.assertIn('remote-dev auth', err.getvalue())
+            self.assertEqual(self.c.open([str(self.home)]), 0)
+        self.assertIn('8765', err.getvalue())
         self.assertEqual(self.c.read_shared(), {})
 
     def test_auth_moves_oauth_forward(self):
+        self.move_patch.stop()
         a, b = self.two_connections()
         self.c.write_shared({'oauth_holder': self.key})
         actions = []
@@ -777,6 +799,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.c.read_shared(), {'oauth_holder': b['key']})
 
     def test_failed_auth_restores_previous_holder(self):
+        self.move_patch.stop()
         a, b = self.two_connections()
         self.c.write_shared({'oauth_holder': self.key})
         def control(values, action, *args):
@@ -1044,7 +1067,7 @@ class CliTests(unittest.TestCase):
         for command in ['start', 'install']:
             self.assertEqual(app.parser().parse_args([command, '-H', 'h', '--name', 'n']).name, 'n')
 
-    def bootstrap(self, browser=False, path=None):
+    def bootstrap(self, browser=False, path=None, target=None):
         executable = self.home / '.local/bin/claude'
         executable.parent.mkdir(parents=True, exist_ok=True)
         executable.write_text('#!' + sys.executable + '\nimport pathlib,os,json\n'
@@ -1056,6 +1079,8 @@ class CliTests(unittest.TestCase):
             config.write_text('{"mcpServers":{"local-dev":{"type":"http","url":"http://127.0.0.1:7676/mcp"}}}')
         payload = {'action': 'open', 'paths': ['/tmp/repo space;$(touch SHOULD_NOT_EXIST)'],
                    'hostname': 'test-local', 'browser': browser}
+        if target:
+            payload['target'] = target
         environment = dict(os.environ, HOME=str(self.home))
         if path is not None:
             environment['PATH'] = path
@@ -1077,6 +1102,27 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads((self.home / 'launched.json').read_text())['path'],
                          str(self.home / '.local/share/remote-dev/bin') + ':' + existing)
+
+    def test_remote_instructions_name_this_server_for_auth_and_stop(self):
+        self.assertEqual(self.bootstrap(target='box').returncode, 0)
+        directory = Path(json.loads((self.home / 'launched.json').read_text())['cwd'])
+        text = (directory / 'CLAUDE.md').read_text()
+        self.assertIn('remote-dev auth -H box', text)
+        self.assertIn('remote-dev stop -H box', text)
+        self.assertIn('ownerToken', text)
+        self.assertEqual(self.bootstrap().returncode, 0, 'older clients send no target')
+        self.assertIn('remote-dev auth -H TARGET', (directory / 'CLAUDE.md').read_text())
+
+    def test_open_sends_the_connection_name_as_target(self):
+        self.connection(name='box')
+        sent = []
+        def channel(value, remote, tty=True):
+            sent.append(json.loads(shlex.split(remote)[3]))
+            return ['/bin/true']
+        with patch.object(self.c, 'connection_ready', return_value=True), \
+                patch.object(self.c, 'channel_command', side_effect=channel):
+            self.c.open([str(self.home)])
+        self.assertEqual(sent[0]['target'], 'box')
 
     def test_same_projects_reuse_remote_directory(self):
         self.assertEqual(self.bootstrap(False).returncode, 0)

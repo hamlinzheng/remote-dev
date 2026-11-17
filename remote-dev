@@ -139,8 +139,10 @@ directory = workspaces / (label + '-' + hashlib.sha256(identity).hexdigest()[:16
 directory.mkdir(parents=True, exist_ok=True, mode=0o700)
 instructions = directory / 'CLAUDE.md'
 header = '# Managed by remote-dev.\n'
+target = settings.get('target') or 'TARGET'
 text = header + '\nLocal repositories:\n' + ''.join('- ' + json.dumps(path) + '\n' for path in settings['paths'])
-text += '''\nUse local-dev MCP for local files, Git, Shell and existing project Docker/build commands. Native Claude tools run on this remote server. Open the selected repositories separately and read their instructions first. Other Claude sessions may share this checkout: coordinate edits and serialize builds using the same outputs. Do not start ROS, replay or business services without an explicit request. Exiting this Claude leaves shared access enabled; remote-dev stop closes it.\n'''
+text += '''\nUse local-dev MCP for local files, Git, Shell and existing project Docker/build commands. Native Claude tools run on this remote server. Open the selected repositories separately and read their instructions first. Other Claude sessions may share this checkout: coordinate edits and serialize builds using the same outputs. Do not start ROS, replay or business services without an explicit request. Exiting this Claude leaves shared access enabled; remote-dev stop -H ''' + target + ''' closes it.\n'''
+text += '\nIf local-dev needs a login, authenticate it in /mcp; the user enters the ownerToken only in the local browser, never in this chat. If the browser callback fails, ask the user to run remote-dev auth -H ' + target + ' locally and retry.\n'
 text += '\nUse local-chrome for the dedicated local browser; coordinate shared pages.\n' if settings['browser'] else '\nBrowser forwarding is disabled.\n'
 previous = instructions.read_text() if instructions.exists() else None
 if previous is not None and not previous.startswith(header):
@@ -154,8 +156,8 @@ os.execv(str(claude), [str(claude)])
 """
 
 
-def remote_command(action, paths=None, browser=False):
-    payload = json.dumps({'action': action, 'paths': paths or [],
+def remote_command(action, paths=None, browser=False, target=None):
+    payload = json.dumps({'action': action, 'paths': paths or [], 'target': target,
                          'hostname': socket.gethostname(), 'browser': browser}, sort_keys=True)
     return shlex.join(['python3', '-c', REMOTE_BOOTSTRAP, payload])
 
@@ -539,51 +541,35 @@ class Controller:
                     self.write_connection(values)
             raise
 
-    def forward_oauth(self, values):
-        """Best effort: the first connection gets the local OAuth callback; others use remote-dev auth."""
+    def move_oauth(self, values):
+        """Point the local OAuth callback at this connection; call under the control lock."""
         shared = self.read_shared()
-        holder = self.read_connection(shared['oauth_holder']) if shared.get('oauth_holder') else None
-        if holder:
-            print('OAuth callback 8765 stays with %s; run remote-dev auth --host %s before a local-dev login.'
-                  % (describe(holder), values['host']), flush=True)
-            return
-        try:
-            result = self.control(values, 'forward', *OAUTH_FORWARD)
-        except subprocess.TimeoutExpired:
-            result = None
-        if result is None or result.returncode:
-            print('Warning: local port 8765 could not be forwarded; local-dev login needs it. '
-                  'Free it, then run remote-dev auth --host ' + values['host'], file=sys.stderr, flush=True)
-            return
+        holder = shared.get('oauth_holder')
+        if values['key'] == LEGACY or holder == values['key']:
+            return False
+        previous = self.read_connection(holder) if holder else None
+        if previous:
+            self.control(previous, 'cancel', *OAUTH_FORWARD)
+        shared.pop('oauth_holder', None)
+        self.write_shared(shared)
+        result = self.control(values, 'forward', *OAUTH_FORWARD)
+        if result.returncode:
+            if previous and self.control(previous, 'forward', *OAUTH_FORWARD).returncode == 0:
+                shared['oauth_holder'] = previous['key']
+                self.write_shared(shared)
+            raise RuntimeError('Local port 8765 could not be forwarded; check for another listener: '
+                               + result.stderr.strip())
         shared['oauth_holder'] = values['key']
         self.write_shared(shared)
+        return True
 
     def auth(self, host=None):
         with self.lock():
             values = self.resolve_active(host)
             if not self.connection_ready(values):
                 raise RuntimeError('Connection to %s is not ready; inspect remote-dev status' % describe(values))
-            shared = self.read_shared()
-            holder = shared.get('oauth_holder')
-            if values['key'] == LEGACY or holder == values['key']:
-                print('OAuth callback 8765 already forwards to ' + describe(values) + '.')
-                return
-            previous = self.read_connection(holder) if holder else None
-            if previous:
-                self.control(previous, 'cancel', *OAUTH_FORWARD)
-            shared.pop('oauth_holder', None)
-            self.write_shared(shared)
-            result = self.control(values, 'forward', *OAUTH_FORWARD)
-            if result.returncode:
-                if previous and self.control(previous, 'forward', *OAUTH_FORWARD).returncode == 0:
-                    shared['oauth_holder'] = previous['key']
-                    self.write_shared(shared)
-                raise RuntimeError('Local port 8765 could not be forwarded; check for another listener: '
-                                   + result.stderr.strip())
-            shared['oauth_holder'] = values['key']
-            self.write_shared(shared)
-        print('OAuth callback 8765 now forwards to %s. Log in to local-dev from a Claude session there.'
-              % describe(values))
+            moved = self.move_oauth(values)
+        print('OAuth callback 8765 %s %s.' % ('now forwards to' if moved else 'already forwards to', describe(values)))
 
     def start(self, host=None, port=None, browser=False, identity_file=None, name=None):
         target = self.target(host, port, identity_file, name)
@@ -666,7 +652,6 @@ class Controller:
                 with self.lock():
                     if not self.read_connection(key):
                         raise RuntimeError('Startup was stopped')
-                    self.forward_oauth(values)
                     values['phase'] = 'ready'
                     values['controller'] = None
                     self.write_connection(values)
@@ -704,7 +689,12 @@ class Controller:
                     if not any(within(path, base) for base in values['scope']):
                         raise ValueError('Path is outside configured development roots: ' + path +
                                          '; edit ' + str(self.config_file) + ' while stopped, then start again')
-                command = remote_command('open', paths, values['browser'])
+                try:  # a local-dev login usually follows open, so the callback follows the session
+                    if self.move_oauth(values):
+                        print('OAuth callback 8765 now forwards to %s.' % describe(values), flush=True)
+                except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                    print('Warning: ' + str(error), file=sys.stderr, flush=True)
+                command = remote_command('open', paths, values['browser'], values.get('name') or values['host'])
                 with defer_signals() as previous_mask:
                     child = subprocess.Popen(self.channel_command(values, command),
                         preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask))
