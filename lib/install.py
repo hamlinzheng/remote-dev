@@ -360,7 +360,7 @@ def install(app, root, host=None, port=22, identity_file=None, browser=False, in
     if host:
         validate_host(host)
     with app.lock('startup.lock', nonblocking=True), app.lock():
-        if app.read_connection() or app.service_active():
+        if app.connections() or app.service_active():
             raise RuntimeError('Stop shared access before install')
         local_install(app, root, browser, install_node)
         print('Local install complete. DevSpace is stopped; no automatic startup was enabled.', flush=True)

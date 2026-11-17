@@ -1,6 +1,6 @@
 # remote-dev
 
-Run Claude Code on a trusted remote Linux server while keeping files, builds and web applications on your local workstation. One SSH connection supports multiple Claude sessions and repositories. Codex support is planned.
+Run Claude Code on a trusted remote Linux server while keeping files, builds and web applications on your local workstation. Several remote servers can be connected at once; each SSH connection supports multiple Claude sessions and repositories. Codex support is planned.
 
 ## Architecture
 
@@ -72,21 +72,38 @@ remote-dev status --json
 remote-dev stop
 ```
 
-`start` enables shared access and returns. Each `open` launches an independent Claude session for the current directory or supplied paths. Multiple sessions can share a project; only one remote target can be active at a time.
+`start` enables shared access and returns. Each `open` launches an independent Claude session for the current directory or supplied paths. Multiple sessions can share a project.
 
 | Command / option | Purpose |
 | --- | --- |
 | `install` | Prepare dependencies, services and MCP configuration |
-| `start --host USER@HOST` | Start shared access; `--browser` enables local Chrome |
-| `open [PATH ...]` | Open a Claude session |
-| `status [--json]` | Inspect access, browser and sessions |
-| `stop` | Close managed sessions and access |
+| `start [-H TARGET]` | Start shared access to a server; `--browser` enables local Chrome |
+| `open [-H TARGET] [PATH ...]` | Open a Claude session |
+| `status [-H TARGET] [--json]` | Inspect access, browser and sessions of all or one connection |
+| `stop [-H TARGET \| --all]` | Close a connection with its sessions, or all of them |
+| `auth [-H TARGET]` | Move the local OAuth callback port `8765` to a connection |
 | `uninstall [--host USER@HOST]` | Remove owned local and optional remote installation resources |
 | `-i`, `--identity-file` | Local SSH private key, for install/start/uninstall |
-| `--ssh-port PORT` | SSH port for install/start/uninstall; default `22` |
+| `--ssh-port PORT` | SSH port for install/start/uninstall; default `22` or the remembered port |
 | `--with-node` | Permit private Node installation when needed |
 
-Every new `start` needs an explicit target. No default host or identity is saved. `-i` is optional when SSH already has a usable identity or agent. Repeating `start` reuses access. With the same host, port and identity, adding `--browser` enables Chrome and its SSH forward without interrupting existing sessions. Repeat it to reopen Chrome after closing it. Other option changes require `stop`. Neither `start` nor `open` installs or updates dependencies.
+`-i` is optional when SSH already has a usable identity or agent. Repeating `start` for a running target reuses access. Adding `--browser` enables Chrome and its SSH forward without interrupting existing sessions. Repeat it to reopen Chrome after closing it. Other option changes for a running target require stopping it. Neither `start` nor `open` installs or updates dependencies.
+
+### Multiple servers and target selection
+
+Run `start` once per server; connections are independent and share the local DevSpace and Chrome. Every successful `start` remembers its target, port and identity-file path (never key contents) in `~/.config/remote-dev/targets.json`.
+
+`TARGET` is an exact `[USER@]HOST` or a prefix of the hostname part, e.g. `nex` for `user@nexcom23`; `user@nex` also restricts the user. A prefix must match exactly one candidate, otherwise the command lists the candidates.
+
+| Command | Without `-H` | With `-H TARGET` |
+| --- | --- | --- |
+| `start` | The running connection if there is exactly one; the last target if none is running; an error if several are running | Remembered or running targets; an unmatched value is used as a new SSH target, so SSH aliases work |
+| `open`, `stop`, `auth` | `REMOTE_DEV_HOST`, else the only running connection; an error if several are running | Running connections only |
+| `status` | All connections | One connection |
+
+Each command prints the resolved target. `REMOTE_DEV_HOST` is never ignored: if it names no running connection, the command fails. Explicit `--ssh-port` and `-i` override remembered values.
+
+Limitations: all servers control the same Chrome pages. A machine can be connected only once: reaching the same server under two names or two users fails because its loopback ports `7676`/`7677` are already forwarded.
 
 Browser support must already be prepared with `install --host USER@HOST --browser`. Closing Chrome leaves SSH, DevSpace and Claude running, but browser tools become unavailable. After enabling or reopening it, reconnect `local-chrome` through Claude's `/mcp` if needed and tell existing sessions that browser access is enabled.
 
@@ -110,7 +127,7 @@ Pass `--ssh-port` for a non-default port.
 
 Native Claude tools run remotely. Use **local-dev** for local files, Git, Shell and project build commands; use **local-chrome** for the local browser.
 
-For the first local-dev login, open `/mcp` in remote Claude. Open its authorization URL locally and enter the `ownerToken` from `~/.config/remote-dev/devspace/auth.json`. Keep this value private. Callback port `8765` is forwarded; authorize initial sessions one at a time. Browser MCP needs no separate AI-account login.
+For the first local-dev login, open `/mcp` in remote Claude. Open its authorization URL locally and enter the `ownerToken` from `~/.config/remote-dev/devspace/auth.json`. Keep this value private. Callback port `8765` is forwarded to the first connection; with several servers, run `remote-dev auth -H TARGET` before logging in on another one. Authorize initial sessions one at a time. Browser MCP needs no separate AI-account login.
 
 Alternatively, run on the remote server:
 
@@ -122,7 +139,7 @@ To allow a development disk outside the default local home root, stop access and
 
 ## Lifecycle and permissions
 
-Exiting one Claude session leaves other sessions and shared access running. Even with no sessions, access stays enabled until stop. Stop closes managed SSH channels, DevSpace and Chrome created by this connection; borrowed/replaced browsers and profile data are preserved. A watcher cleans up owned access after detecting SSH or DevSpace failure. There is no automatic startup or reconnection.
+Exiting one Claude session leaves other sessions and shared access running. Even with no sessions, access stays enabled until stop. Stop closes a connection's SSH channels and sessions; DevSpace and Chrome started by remote-dev stop with the last connection that uses them, while borrowed/replaced browsers and profile data are preserved. Each connection's watcher cleans it up after detecting SSH or DevSpace failure. There is no automatic startup or reconnection.
 
 Stop does not undo edits or stop independent project containers. The tool does not launch ROS, replay data or start business services. Parallel sessions share files and browser pages: coordinate edits and shared builds, or use Git worktrees for separate branches.
 
@@ -134,7 +151,7 @@ Keep SSH-server `GatewayPorts no` so reverse forwards stay on loopback. CDP has 
 
 Installation is repeatable while access is stopped. It preserves authentication/configuration and refuses unrelated command entries, services and MCP registrations. Both npm runtimes use repository lockfiles and staged `npm ci` installation. If remote preparation fails, completed local install remains usable; fix the error and rerun install.
 
-To update, stop access, update this checkout and rerun install. Tracked runtime trees are removed by uninstall when no preserved MCP registration needs them; untracked legacy directories are left alone. Back up application data before downgrading because database migrations may limit compatibility.
+To update, stop access, update this checkout and rerun install. A connection started by a version before multi-server support can still be used with `open`, `status` and `stop`, but new connections are refused until it is stopped. Tracked runtime trees are removed by uninstall when no preserved MCP registration needs them; untracked legacy directories are left alone. Back up application data before downgrading because database migrations may limit compatibility.
 
 ```bash
 remote-dev uninstall --host USER@HOST -i /path/to/private-key

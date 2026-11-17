@@ -25,14 +25,23 @@ class CliTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
         self.c = app.Controller(self.home, self.home / 'run')
+        self.key = app.target_key('user@host', 22)
+        self.p = self.c.paths(self.key)
 
     def connection(self, **overrides):
         value = {'id': 'bridge', 'phase': 'ready', 'host': 'user@host', 'ssh_port': 22,
-                 'scope': [str(self.home)], 'browser': False,
-                 'service_owned': False, 'browser_owned': False}
+                 'scope': [str(self.home)], 'browser': False}
         value.update(overrides)
+        value.setdefault('key', app.target_key(value['host'], value['ssh_port']))
         self.c.write_connection(value)
         return value
+
+    def session(self, name, process, key=None, **extra):
+        record = {'id': name, 'client': 'claude', 'connection': key or self.key, 'paths': [str(self.home)],
+                  'ssh': app.process_record(process.pid)}
+        record.update(extra)
+        app.atomic_json(self.c.sessions_dir / (name + '.json'), record)
+        return record
 
     def child(self):
         process = subprocess.Popen(['/bin/sleep', '30'])
@@ -43,11 +52,14 @@ class CliTests(unittest.TestCase):
         self.addCleanup(cleanup)
         return process
 
-    def test_start_requires_host_but_no_project(self):
-        with self.assertRaises(SystemExit):
-            app.parser().parse_args(['start'])
-        args = app.parser().parse_args(['start', '--host', 'user@host'])
+    def test_start_host_is_optional_and_takes_no_project(self):
+        self.assertIsNone(app.parser().parse_args(['start']).host)
+        self.assertIsNone(app.parser().parse_args(['start']).ssh_port)
+        args = app.parser().parse_args(['start', '-H', 'user@host'])
         self.assertEqual(args.host, 'user@host')
+        for command in [['open'], ['stop'], ['status'], ['auth']]:
+            self.assertEqual(app.parser().parse_args(command + ['-H', 'nex']).host, 'nex')
+        self.assertTrue(app.parser().parse_args(['stop', '--all']).all)
         with self.assertRaises(SystemExit):
             app.parser().parse_args(['start', '--host', 'user@host', '--root', '.'])
 
@@ -95,7 +107,9 @@ class CliTests(unittest.TestCase):
         self.assertIn('ForwardAgent=no', args)
         self.assertIn('127.0.0.1:7676:127.0.0.1:7676', args)
         self.assertNotIn('127.0.0.1:9222:127.0.0.1:9222', args)
-        self.assertIn('127.0.0.1:7677:' + str(self.c.clipboard_socket), args)
+        self.assertIn('127.0.0.1:7677:' + str(self.p.clipboard), args)
+        self.assertNotIn('127.0.0.1:8765:127.0.0.1:8765', args)
+        self.assertEqual(args[args.index('-S') + 1], str(self.p.ssh))
         value['browser'] = True
         self.assertIn('127.0.0.1:9222:127.0.0.1:9222', self.c.master_command(value))
 
@@ -143,12 +157,12 @@ class CliTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, 'strict JSON.*comments.*trailing commas'):
                         self.c.start('tester@server', 22, False)
                 self.assertEqual(self.c.config_file.read_text(), invalid)
-                self.assertFalse(self.c.connection_file.exists())
+                self.assertEqual(self.c.connections(), [])
 
     def test_status_read_tolerates_concurrent_connection_removal(self):
         self.connection()
         with patch.object(Path, 'read_text', side_effect=FileNotFoundError):
-            self.assertIsNone(self.c.read_connection())
+            self.assertIsNone(self.c.read_connection(self.key))
 
     def test_open_uses_current_directory_and_keeps_connection(self):
         self.connection()
@@ -162,7 +176,7 @@ class CliTests(unittest.TestCase):
                 patch.object(self.c, 'cleanup', side_effect=AssertionError('open closed the shared connection')):
             self.assertEqual(self.c.open([]), 0)
         self.assertEqual(command[0]['paths'], [str(self.home)])
-        self.assertEqual(self.c.read_connection()['id'], 'bridge')
+        self.assertEqual(self.c.read_connection(self.key)['id'], 'bridge')
         self.assertEqual(list(self.c.sessions_dir.glob('*.json')), [])
 
     def test_open_restores_terminal_only_after_dropped_channel(self):
@@ -184,20 +198,18 @@ class CliTests(unittest.TestCase):
                 patch.object(self.c, 'systemctl', side_effect=AssertionError('service restarted')):
             with self.assertRaises(ValueError):
                 self.c.open([str(self.home)])
-        self.assertEqual(self.c.read_connection()['scope'], [str(self.home / 'inside')])
+        self.assertEqual(self.c.read_connection(self.key)['scope'], [str(self.home / 'inside')])
 
     def test_open_exit_removes_only_its_own_session(self):
         self.connection()
         other = self.child()
-        app.atomic_json(self.c.sessions_dir / 'other.json', {
-            'id': 'other', 'client': 'claude', 'paths': [str(self.home)],
-            'ssh': app.process_record(other.pid)})
+        self.session('other', other)
         with patch.object(self.c, 'connection_ready', return_value=True), \
                 patch.object(self.c, 'channel_command', return_value=['/bin/true']):
             self.c.open([str(self.home)])
         self.assertIsNone(other.poll())
         self.assertTrue((self.c.sessions_dir / 'other.json').exists())
-        self.assertEqual(self.c.read_connection()['id'], 'bridge')
+        self.assertEqual(self.c.read_connection(self.key)['id'], 'bridge')
 
     def test_stop_closes_all_owned_channels_but_not_stale_pid(self):
         self.connection()
@@ -207,13 +219,13 @@ class CliTests(unittest.TestCase):
             if index == 2:
                 record['start'] = 'stale'
             app.atomic_json(self.c.sessions_dir / ('%s.json' % index), {
-                'id': str(index), 'client': 'claude', 'paths': [], 'ssh': record})
+                'id': str(index), 'client': 'claude', 'connection': self.key, 'paths': [], 'ssh': record})
         with patch.object(self.c, 'control', return_value=subprocess.CompletedProcess([], 1, '', '')):
-            self.c.cleanup('bridge')
+            self.c.cleanup(self.key, 'bridge')
         self.assertIsNotNone(children[0].poll())
         self.assertIsNotNone(children[1].poll())
         self.assertIsNone(children[2].poll())
-        self.assertFalse(self.c.connection_file.exists())
+        self.assertFalse(self.p.connection.exists())
 
     def test_failed_master_start_rolls_back_owned_service(self):
         self.c.config_dir.mkdir(parents=True)
@@ -231,7 +243,7 @@ class CliTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.c.start('user@host', 22, False)
         self.assertFalse(marker.exists())
-        self.assertFalse(self.c.connection_file.exists())
+        self.assertFalse(self.p.connection.exists())
 
     def test_cleanup_preserves_borrowed_browser(self):
         marker = self.home / 'browser-alive'
@@ -239,7 +251,7 @@ class CliTests(unittest.TestCase):
         self.connection(browser=True, browser_owned=False)
         with patch.object(self.c, 'control'), \
                 patch.object(self.c.browser, 'stop', side_effect=lambda *args: marker.unlink()):
-            self.c.cleanup('bridge')
+            self.c.cleanup(self.key, 'bridge')
         self.assertTrue(marker.exists())
 
     def test_start_signal_during_recording_recovers_transport(self):
@@ -260,7 +272,7 @@ class CliTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 self.c.start('user@host', 22, False)
         self.assertIsNone(real_record(pids[0]))
-        self.assertFalse(self.c.connection_file.exists())
+        self.assertFalse(self.p.connection.exists())
 
     def test_open_signal_recovers_channel_and_preserves_connection(self):
         self.connection()
@@ -276,18 +288,17 @@ class CliTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 self.c.open([str(self.home)])
         self.assertIsNone(real_record(pids[0]))
-        self.assertTrue(self.c.connection_file.exists())
+        self.assertTrue(self.p.connection.exists())
         self.assertFalse(list(self.c.sessions_dir.glob('*.json')))
 
     def test_watcher_recovers_all_channels_after_master_loss(self):
         self.connection()
         child = self.child()
-        app.atomic_json(self.c.sessions_dir / 'one.json', {
-            'id': 'one', 'client': 'claude', 'paths': [], 'ssh': app.process_record(child.pid)})
+        self.session('one', child)
         with patch.object(self.c, 'connection_ready', return_value=False):
-            self.c.watch('bridge')
+            self.c.watch(self.key, 'bridge')
         self.assertIsNotNone(child.poll())
-        self.assertFalse(self.c.connection_file.exists())
+        self.assertFalse(self.p.connection.exists())
 
     def test_status_lists_each_live_and_stale_session(self):
         self.connection()
@@ -296,29 +307,30 @@ class CliTests(unittest.TestCase):
             if not live:
                 record['start'] = 'stale'
             app.atomic_json(self.c.sessions_dir / (name + '.json'), {
-                'id': name, 'client': 'claude', 'paths': [str(self.home)], 'ssh': record})
+                'id': name, 'client': 'claude', 'connection': self.key, 'paths': [str(self.home)], 'ssh': record})
         with patch.object(self.c, 'service_active', return_value=True), \
                 patch.object(self.c, 'control', return_value=subprocess.CompletedProcess([], 0, '', '')):
             result = self.c.status()
         self.assertTrue(result['running'])
         self.assertEqual(result['active_sessions'], 2)
-        self.assertEqual(len(result['sessions']), 3)
+        self.assertEqual(len(result['connections'][0]['sessions']), 3)
 
     def test_repeated_start_reuses_target_and_rejects_changes(self):
         self.connection()
+        key = self.home / 'other-key'
+        key.touch()
         with patch.object(self.c, 'connection_ready', return_value=True), \
                 patch.object(self.c, 'master_command', side_effect=AssertionError('second master')):
             self.c.start('user@host', 22, False)
-            with self.assertRaises(RuntimeError):
-                self.c.start('other@host', 22, False)
-        self.assertEqual(self.c.read_connection()['host'], 'user@host')
+            self.c.start(None, None, False)
+            with self.assertRaisesRegex(RuntimeError, 'recorded'):
+                self.c.start('user@host', 22, False, str(key))
+        self.assertEqual(self.c.read_connection(self.key)['host'], 'user@host')
 
     def browser_environment(self, *, browser=False, fail_forward=False, timeout_forward=False, interrupt=False):
         self.connection(browser=browser)
         child = self.child()
-        app.atomic_json(self.c.sessions_dir / 'existing.json', {
-            'id': 'existing', 'client': 'claude', 'paths': [str(self.home)],
-            'ssh': app.process_record(child.pid)})
+        self.session('existing', child)
         browser_alive = self.home / 'browser-alive'
         forwarding = self.home / 'browser-forward'
         if browser:
@@ -369,38 +381,38 @@ class CliTests(unittest.TestCase):
     def test_start_enables_browser_without_restarting_existing_sessions(self):
         child, browser_alive, forwarding = self.browser_environment()
         self.c.start('user@host', 22, True)
-        value = self.c.read_connection()
+        value = self.c.read_connection(self.key)
         self.assertTrue(value['browser'])
-        self.assertTrue(value['browser_owned'])
+        self.assertTrue(self.c.read_shared()['browser_owned'])
         self.assertEqual(value['id'], 'bridge')
         self.assertTrue(browser_alive.exists())
         self.assertTrue(forwarding.exists())
         self.assertIsNone(child.poll())
         self.assertTrue((self.c.sessions_dir / 'existing.json').is_file())
         self.c.start('user@host', 22, True)
-        self.assertTrue(self.c.read_connection()['browser_owned'])
+        self.assertTrue(self.c.read_shared()['browser_owned'])
 
     def test_start_reopens_closed_browser_without_adding_duplicate_forward(self):
         child, browser_alive, forwarding = self.browser_environment(browser=True)
         self.c.start('user@host', 22, True)
         self.assertTrue(browser_alive.exists())
         self.assertTrue(forwarding.exists())
-        self.assertTrue(self.c.read_connection()['browser_owned'])
+        self.assertTrue(self.c.read_shared()['browser_owned'])
         self.assertIsNone(child.poll())
 
     def test_browser_forward_failure_preserves_connection_and_sessions(self):
         child, browser_alive, forwarding = self.browser_environment(fail_forward=True)
-        before = self.c.read_connection()
+        before = self.c.read_connection(self.key)
         with self.assertRaisesRegex(RuntimeError, 'remote port occupied'):
             self.c.start('user@host', 22, True)
-        self.assertEqual(self.c.read_connection(), before)
+        self.assertEqual(self.c.read_connection(self.key), before)
         self.assertFalse(browser_alive.exists())
         self.assertFalse(forwarding.exists())
         self.assertIsNone(child.poll())
 
     def test_browser_record_failure_cancels_added_forward(self):
         child, browser_alive, forwarding = self.browser_environment()
-        before = self.c.read_connection()
+        before = self.c.read_connection(self.key)
         original = self.c.write_connection
         def write(value):
             if value['browser']:
@@ -409,40 +421,40 @@ class CliTests(unittest.TestCase):
         with patch.object(self.c, 'write_connection', side_effect=write):
             with self.assertRaisesRegex(OSError, 'disk full'):
                 self.c.start('user@host', 22, True)
-        self.assertEqual(self.c.read_connection(), before)
+        self.assertEqual(self.c.read_connection(self.key), before)
         self.assertFalse(browser_alive.exists())
         self.assertFalse(forwarding.exists())
         self.assertIsNone(child.poll())
 
     def test_browser_forward_timeout_cancels_uncertain_forward(self):
         child, browser_alive, forwarding = self.browser_environment(timeout_forward=True)
-        before = self.c.read_connection()
+        before = self.c.read_connection(self.key)
         with self.assertRaises(subprocess.TimeoutExpired):
             self.c.start('user@host', 22, True)
         self.assertFalse(forwarding.exists())
         self.assertFalse(browser_alive.exists())
-        self.assertEqual(self.c.read_connection(), before)
+        self.assertEqual(self.c.read_connection(self.key), before)
         self.assertIsNone(child.poll())
 
     def test_interrupted_browser_upgrade_rolls_back_only_new_resources(self):
         child, browser_alive, forwarding = self.browser_environment(interrupt=True)
-        before = self.c.read_connection()
+        before = self.c.read_connection(self.key)
         with self.assertRaises(KeyboardInterrupt):
             self.c.start('user@host', 22, True)
         self.assertFalse(browser_alive.exists())
         self.assertFalse(forwarding.exists())
-        self.assertEqual(self.c.read_connection(), before)
+        self.assertEqual(self.c.read_connection(self.key), before)
         self.assertIsNone(child.poll())
 
     def test_browser_prepare_failure_does_not_create_local_resources(self):
         child, browser_alive, forwarding = self.browser_environment()
-        before = self.c.read_connection()
+        before = self.c.read_connection(self.key)
         with patch.object(app.subprocess, 'run', side_effect=[
                 subprocess.CompletedProcess([], 0, '', ''),
                 subprocess.CalledProcessError(1, ['ssh'])]):
             with self.assertRaises(subprocess.CalledProcessError):
                 self.c.start('user@host', 22, True)
-        self.assertEqual(self.c.read_connection(), before)
+        self.assertEqual(self.c.read_connection(self.key), before)
         self.assertFalse(browser_alive.exists())
         self.assertFalse(forwarding.exists())
         self.assertIsNone(child.poll())
@@ -453,7 +465,7 @@ class CliTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'remote port occupied'):
             self.c.start('user@host', 22, True)
         self.assertTrue(browser_alive.exists())
-        self.assertFalse(self.c.read_connection()['browser'])
+        self.assertFalse(self.c.read_connection(self.key)['browser'])
         self.assertFalse(forwarding.exists())
         self.assertIsNone(child.poll())
 
@@ -461,9 +473,9 @@ class CliTests(unittest.TestCase):
         self.connection(watcher_owned=True)
         interleaved = self.home / 'new-start-interleaved'
         def watcher_stop(*args, **kwargs):
-            if kwargs.get('unit') == app.WATCH_UNIT:
+            if kwargs.get('unit') == self.p.unit:
                 try:
-                    with self.c.lock('startup.lock', nonblocking=True):
+                    with self.c.lock(self.p.lock, nonblocking=True):
                         interleaved.touch()
                 except RuntimeError:
                     pass
@@ -475,28 +487,28 @@ class CliTests(unittest.TestCase):
     def test_stop_removes_abandoned_unix_control_socket(self):
         self.c.runtime.mkdir(parents=True)
         with socket.socket(socket.AF_UNIX) as listener:
-            listener.bind(str(self.c.ssh_socket))
+            listener.bind(str(self.c.paths(app.LEGACY).ssh))
         with patch.object(self.c, 'service_active', return_value=False):
             self.c.stop()
-        self.assertFalse(self.c.ssh_socket.exists())
+        self.assertFalse(self.c.paths(app.LEGACY).ssh.exists())
 
     def test_stop_preserves_untracked_active_control_socket(self):
         self.c.runtime.mkdir(parents=True)
         with socket.socket(socket.AF_UNIX) as listener:
-            listener.bind(str(self.c.ssh_socket))
+            listener.bind(str(self.c.paths(app.LEGACY).ssh))
             listener.listen()
             with patch.object(self.c, 'service_active', return_value=False):
                 with self.assertRaisesRegex(RuntimeError, 'Untracked.*socket'):
                     self.c.stop()
-            self.assertTrue(self.c.ssh_socket.exists())
+            self.assertTrue(self.c.paths(app.LEGACY).ssh.exists())
 
     def test_stop_preserves_unexpected_file_at_control_socket_path(self):
         self.c.runtime.mkdir(parents=True)
-        self.c.ssh_socket.write_text('user-owned file')
+        self.c.paths(app.LEGACY).ssh.write_text('user-owned file')
         with patch.object(self.c, 'service_active', return_value=False):
             with self.assertRaisesRegex(RuntimeError, 'socket'):
                 self.c.stop()
-        self.assertEqual(self.c.ssh_socket.read_text(), 'user-owned file')
+        self.assertEqual(self.c.paths(app.LEGACY).ssh.read_text(), 'user-owned file')
 
     def test_session_record_write_failure_reaps_channel_not_connection(self):
         self.connection()
@@ -505,8 +517,307 @@ class CliTests(unittest.TestCase):
                 patch.object(app, 'atomic_json', side_effect=OSError('disk full')):
             with self.assertRaises(OSError):
                 self.c.open([str(self.home)])
-        self.assertTrue(self.c.connection_file.exists())
+        self.assertTrue(self.p.connection.exists())
         self.assertFalse(list(self.c.sessions_dir.glob('*.json')))
+
+    # Multiple connections, target resolution, OAuth callback and legacy state.
+
+    def ok(self, *args, **kwargs):
+        return subprocess.CompletedProcess([], 0, '', '')
+
+    def two_connections(self, **b):
+        a = self.connection()
+        b = self.connection(id='other', host='me@nexcom23', **b)
+        return a, b
+
+    def test_hostname_prefix_matching(self):
+        items = [{'host': 'user@nexcom23', 'ssh_port': 22}, {'host': 'ubuntu@aws-sg', 'ssh_port': 22},
+                 {'host': 'root@nexcom24', 'ssh_port': 2222}, {'host': 'dev-server', 'ssh_port': 22}]
+        self.assertEqual(app.match_targets('aws', items), [items[1]])
+        self.assertEqual(app.match_targets('dev', items), [items[3]])
+        self.assertEqual(len(app.match_targets('nexcom', items)), 2)
+        self.assertEqual(app.match_targets('root@nex', items), [items[2]])
+        self.assertEqual(app.match_targets('ubuntu@aws-sg', items), [items[1]])
+        self.assertEqual(app.match_targets('23', items), [], 'only hostname prefixes match')
+        self.assertEqual(app.match_targets('sg', items), [])
+
+    def remembered(self, *targets):
+        app.atomic_json(self.c.targets_file, {'targets': [
+            {'host': host, 'ssh_port': port, 'identity_file': identity, 'last_used': used}
+            for host, port, identity, used in targets]})
+
+    def test_start_resolves_remembered_targets(self):
+        with self.assertRaisesRegex(RuntimeError, 'pass --host'):
+            self.c.resolve_start(None, None, None)
+        self.remembered(('user@nexcom23', 2222, '/keys/nex', 10), ('ubuntu@aws-sg', 22, '/keys/aws', 20),
+                        ('ubuntu@aws-tokyo', 22, None, 5))
+        last = self.c.resolve_start(None, None, None)
+        self.assertEqual((last['host'], last['identity_file'], last['note']), ('ubuntu@aws-sg', '/keys/aws', 'last used'))
+        nex = self.c.resolve_start('nex', None, None)
+        self.assertEqual((nex['host'], nex['ssh_port'], nex['identity_file']), ('user@nexcom23', 2222, '/keys/nex'))
+        self.assertIn('matched', nex['note'])
+        override = self.c.resolve_start('nex', None, '/keys/other')
+        self.assertEqual(override['identity_file'], '/keys/other')
+        with self.assertRaisesRegex(RuntimeError, 'several'):
+            self.c.resolve_start('aws', None, None)
+        self.assertEqual(self.c.resolve_start('aws', 2200, None)['host'], 'aws', 'port filters candidates')
+        literal = self.c.resolve_start('new@box', None, None)
+        self.assertEqual((literal['host'], literal['ssh_port'], literal['identity_file']), ('new@box', 22, None))
+        with self.assertRaises(ValueError):
+            self.c.resolve_start('-oProxyCommand=x', None, None)
+
+    def test_start_without_host_follows_running_connections(self):
+        self.remembered(('ubuntu@aws-sg', 22, None, 20))
+        self.connection()
+        self.assertEqual(self.c.resolve_start(None, None, None)['host'], 'user@host')
+        self.connection(id='other', host='me@nexcom23')
+        with self.assertRaisesRegex(RuntimeError, 'Several connections'):
+            self.c.resolve_start(None, None, None)
+        self.assertEqual(self.c.resolve_start('nex', None, None)['host'], 'me@nexcom23')
+
+    def test_remember_upserts_most_recent_target(self):
+        self.remembered(('user@host', 22, None, 1), ('me@nexcom23', 22, None, 2))
+        self.c.remember({'host': 'user@host', 'ssh_port': 22, 'identity_file': '/k'})
+        targets = self.c.read_targets()
+        self.assertEqual([(t['host'], t['identity_file']) for t in targets], [('user@host', '/k'), ('me@nexcom23', None)])
+        self.assertEqual(self.c.targets_file.stat().st_mode & 0o777, 0o600)
+
+    def test_active_resolution_uses_single_connection_or_explicit_choice(self):
+        with self.assertRaisesRegex(RuntimeError, 'start'):
+            self.c.resolve_active()
+        self.connection()
+        self.assertEqual(self.c.resolve_active()['host'], 'user@host')
+        self.connection(id='other', host='me@nexcom23')
+        with self.assertRaisesRegex(RuntimeError, 'Several connections.*REMOTE_DEV_HOST'):
+            self.c.resolve_active()
+        self.assertEqual(self.c.resolve_active('nex')['host'], 'me@nexcom23')
+        with patch.dict(os.environ, {'REMOTE_DEV_HOST': 'host'}):
+            self.assertEqual(self.c.resolve_active()['host'], 'user@host')
+            self.assertEqual(self.c.resolve_active('nex')['host'], 'me@nexcom23')
+        with patch.dict(os.environ, {'REMOTE_DEV_HOST': 'aws'}):
+            with self.assertRaisesRegex(RuntimeError, 'No running connection matches aws'):
+                self.c.resolve_active()
+
+    def test_open_records_connection_and_uses_selected_master(self):
+        a, b = self.two_connections()
+        seen = []
+        def channel(value, remote, tty=True):
+            seen.append(value['key'])
+            for _, record in self.c.sessions():
+                seen.append(record['connection'])
+            return ['/bin/true']
+        with patch.object(self.c, 'connection_ready', return_value=True), \
+                patch.object(self.c, 'channel_command', side_effect=channel):
+            with self.assertRaisesRegex(RuntimeError, 'Several'):
+                self.c.open([str(self.home)])
+            self.assertEqual(self.c.open([str(self.home)], host='nex'), 0)
+        self.assertEqual(seen[0], b['key'])
+        self.assertEqual(self.c.channel_command(b, 'x')[3], str(self.c.paths(b['key']).ssh))
+
+    def test_cleanup_of_one_connection_keeps_other_sessions_and_shared_resources(self):
+        a, b = self.two_connections(browser=True)
+        mine, theirs = self.child(), self.child()
+        self.session('mine', mine)
+        self.session('theirs', theirs, key=b['key'])
+        self.c.write_shared({'devspace_owned': True, 'browser_owned': True, 'browser_stamp': 's',
+                             'oauth_holder': self.key})
+        with patch.object(self.c, 'control', side_effect=self.ok), \
+                patch.object(self.c, 'systemctl', side_effect=AssertionError('shared DevSpace stopped')), \
+                patch.object(self.c.browser, 'stop', side_effect=AssertionError('shared Chrome stopped')):
+            self.c.cleanup(self.key, 'bridge')
+        self.assertIsNotNone(mine.poll())
+        self.assertIsNone(theirs.poll())
+        self.assertIsNone(self.c.read_connection(self.key))
+        self.assertFalse(self.p.dir.exists())
+        self.assertEqual(self.c.read_shared(), {'devspace_owned': True, 'browser_owned': True, 'browser_stamp': 's'})
+
+    def test_last_cleanup_stops_owned_shared_resources(self):
+        a, b = self.two_connections()
+        self.connection(browser=True)
+        self.c.write_shared({'devspace_owned': True, 'browser_owned': True, 'browser_stamp': 's'})
+        stopped = []
+        with patch.object(self.c, 'control', side_effect=self.ok), \
+                patch.object(self.c, 'systemctl', side_effect=lambda *a, **k: stopped.append(a)), \
+                patch.object(self.c.browser, 'stop', side_effect=lambda expected_stamp: stopped.append(expected_stamp)):
+            self.c.cleanup(self.key, 'bridge')
+            self.assertEqual(stopped, ['s'], 'Chrome stops with its last browser connection')
+            self.c.cleanup(b['key'], 'other')
+        self.assertEqual(stopped, ['s', ('stop',)])
+        self.assertFalse(self.c.shared_file.exists())
+
+    def test_failed_service_stop_is_retried_by_stop(self):
+        self.connection()
+        self.c.write_shared({'devspace_owned': True})
+        with patch.object(self.c, 'control', side_effect=self.ok), \
+                patch.object(self.c, 'systemctl', side_effect=subprocess.CalledProcessError(1, 'systemctl')):
+            with self.assertRaisesRegex(RuntimeError, 'retry stop'):
+                self.c.cleanup(self.key, 'bridge')
+        self.assertEqual(self.c.read_shared(), {'devspace_owned': True})
+        calls = []
+        with patch.object(self.c, 'systemctl', side_effect=lambda *a, **k: calls.append(a)), \
+                patch.object(self.c, 'service_active', return_value=True):
+            self.c.stop()
+        self.assertEqual(calls, [('stop',)])
+        self.assertEqual(self.c.read_shared(), {})
+
+    def start_fixture(self):
+        self.c.config_dir.mkdir(parents=True)
+        self.c.config_file.write_text(json.dumps({'workspaces': {'allowedRoots': [str(self.home)]}}))
+
+    def test_second_connection_reuses_running_devspace_and_rolls_back_alone(self):
+        self.start_fixture()
+        self.connection(host='me@nexcom23')
+        self.c.write_shared({'devspace_owned': True})
+        with patch.object(self.c, 'systemctl', side_effect=AssertionError('service changed')), \
+                patch.object(self.c, 'service_active', return_value=True), \
+                patch.object(self.c, 'wait_health'), \
+                patch.object(self.c, 'master_command', return_value=['/bin/false']), \
+                patch.object(app, 'require_free_port', side_effect=AssertionError('port probed')):
+            with self.assertRaisesRegex(RuntimeError, 'another name or user'):
+                self.c.start('user@host', 22, False)
+        self.assertIsNone(self.c.read_connection(self.key))
+        self.assertEqual([item['host'] for item in self.c.connections()], ['me@nexcom23'])
+        self.assertEqual(self.c.read_shared(), {'devspace_owned': True})
+
+    def test_untracked_service_without_connections_is_refused(self):
+        self.start_fixture()
+        with patch.object(self.c, 'service_active', return_value=True), \
+                patch.object(self.c, 'systemctl', side_effect=AssertionError('service changed')):
+            with self.assertRaisesRegex(RuntimeError, 'Untracked'):
+                self.c.start('user@host', 22, False)
+
+    def test_successful_start_forwards_oauth_once_and_remembers_target(self):
+        self.start_fixture()
+        actions = []
+        def control(values, action, *args):
+            actions.append((values['host'], action) + args)
+            return subprocess.CompletedProcess([], 0, 'Master running (pid=%d)' % os.getpid(), '')
+        def run(args, **kwargs):
+            return subprocess.CompletedProcess(args, 0, '', '')
+        with patch.object(self.c, 'systemctl', side_effect=self.ok), \
+                patch.object(self.c, 'service_active', return_value=False), \
+                patch.object(self.c, 'wait_health'), \
+                patch.object(self.c, 'master_command', return_value=['/bin/true']), \
+                patch.object(self.c, 'control', side_effect=control), \
+                patch.object(app, 'require_free_port'), \
+                patch.object(app.subprocess, 'run', side_effect=run):
+            self.c.start('user@host', 22, False)
+        self.assertIn(('user@host', 'forward') + app.OAUTH_FORWARD, actions)
+        self.assertEqual(self.c.read_shared(), {'devspace_owned': True, 'oauth_holder': self.key})
+        value = self.c.read_connection(self.key)
+        self.assertEqual((value['phase'], value['watcher_owned']), ('ready', True))
+        self.assertEqual(self.c.read_targets()[0]['host'], 'user@host')
+
+    def test_oauth_forward_is_best_effort(self):
+        a, b = self.two_connections()
+        self.c.write_shared({'oauth_holder': self.key})
+        with patch.object(self.c, 'control', side_effect=AssertionError('forward attempted')):
+            self.c.forward_oauth(b)
+        self.c.write_shared({})
+        with patch.object(self.c, 'control', return_value=subprocess.CompletedProcess([], 1, '', 'in use')), \
+                patch.object(app.sys, 'stderr', io.StringIO()) as err:
+            self.c.forward_oauth(b)
+        self.assertIn('remote-dev auth', err.getvalue())
+        self.assertEqual(self.c.read_shared(), {})
+
+    def test_auth_moves_oauth_forward(self):
+        a, b = self.two_connections()
+        self.c.write_shared({'oauth_holder': self.key})
+        actions = []
+        def control(values, action, *args):
+            actions.append((values['host'], action))
+            return subprocess.CompletedProcess([], 0, '', '')
+        with patch.object(self.c, 'connection_ready', return_value=True), \
+                patch.object(self.c, 'control', side_effect=control):
+            self.c.auth('nex')
+        self.assertEqual(actions, [('user@host', 'cancel'), ('me@nexcom23', 'forward')])
+        self.assertEqual(self.c.read_shared(), {'oauth_holder': b['key']})
+
+    def test_failed_auth_restores_previous_holder(self):
+        a, b = self.two_connections()
+        self.c.write_shared({'oauth_holder': self.key})
+        def control(values, action, *args):
+            return subprocess.CompletedProcess([], int(values['host'] == 'me@nexcom23'), '', 'busy')
+        with patch.object(self.c, 'connection_ready', return_value=True), \
+                patch.object(self.c, 'control', side_effect=control):
+            with self.assertRaisesRegex(RuntimeError, '8765'):
+                self.c.auth('nex')
+        self.assertEqual(self.c.read_shared(), {'oauth_holder': self.key})
+
+    def test_stop_requires_choice_with_several_connections(self):
+        a, b = self.two_connections()
+        with patch.object(self.c, 'control', side_effect=self.ok), \
+                patch.object(self.c, 'systemctl', side_effect=self.ok), \
+                patch.object(self.c, 'service_active', return_value=True):
+            with self.assertRaisesRegex(RuntimeError, 'Several'):
+                self.c.stop()
+            self.c.stop('nex')
+            self.assertEqual([item['host'] for item in self.c.connections()], ['user@host'])
+            self.connection(id='other', host='me@nexcom23')
+            self.c.stop(everything=True)
+        self.assertEqual(self.c.connections(), [])
+
+    def test_status_groups_sessions_by_connection(self):
+        a, b = self.two_connections()
+        self.session('mine', self.child())
+        self.session('theirs', self.child(), key=b['key'])
+        self.session('old', self.child(), connection=None)
+        self.c.write_shared({'oauth_holder': b['key']})
+        with patch.object(self.c, 'service_active', return_value=True), \
+                patch.object(self.c, 'control', side_effect=self.ok):
+            result = self.c.status()
+            single = self.c.status('nex')
+        self.assertEqual([(c['host'], c['active_sessions'], c['oauth_callback']) for c in result['connections']],
+                         [('me@nexcom23', 1, True), ('user@host', 1, False)])
+        self.assertEqual(result['active_sessions'], 2)
+        self.assertEqual([c['host'] for c in single['connections']], ['me@nexcom23'])
+
+    def legacy(self, **overrides):
+        value = {'id': 'old', 'phase': 'ready', 'host': 'user@old', 'ssh_port': 22, 'scope': [str(self.home)],
+                 'browser': False, 'service_owned': True, 'browser_owned': False, 'watcher_owned': True}
+        value.update(overrides)
+        app.atomic_json(self.c.runtime / 'connection.json', value)
+        return self.c.read_connection(app.LEGACY)
+
+    def test_legacy_connection_is_listed_used_and_stopped(self):
+        legacy = self.legacy(browser=True, browser_owned=True, browser_stamp='old-stamp')
+        self.assertEqual([item['key'] for item in self.c.connections()], [app.LEGACY])
+        self.assertEqual(self.c.channel_command(legacy, 'x')[3], str(self.c.runtime / 'ssh.sock'))
+        child = self.child()
+        app.atomic_json(self.c.sessions_dir / 'old.json', {
+            'id': 'old', 'client': 'claude', 'paths': [], 'ssh': app.process_record(child.pid)})
+        calls = []
+        with patch.object(self.c, 'control', side_effect=self.ok), \
+                patch.object(self.c, 'systemctl', side_effect=lambda *a, **k: calls.append((a, k.get('unit')))), \
+                patch.object(self.c.browser, 'stop', side_effect=lambda expected_stamp: calls.append(expected_stamp)):
+            self.c.stop()
+        self.assertIsNotNone(child.poll())
+        self.assertIn((('stop',), None), calls)
+        self.assertIn('old-stamp', calls)
+        self.assertIn((('stop',), app.WATCH_UNIT), calls)
+        self.assertFalse((self.c.runtime / 'connection.json').exists())
+        self.assertEqual(self.c.read_shared(), {})
+
+    def test_new_connection_is_refused_while_legacy_runs(self):
+        self.start_fixture()
+        self.legacy()
+        with patch.object(self.c, 'service_active', return_value=True), \
+                patch.object(self.c, 'systemctl', side_effect=AssertionError('service changed')):
+            with self.assertRaisesRegex(RuntimeError, 'older remote-dev'):
+                self.c.start('user@host', 22, False)
+
+    def test_watch_argument_forms(self):
+        calls = []
+        with patch.object(app.Controller, 'watch', side_effect=lambda *args: calls.append(args)):
+            app.main(['_watch', 'abc123', 'id-1'])
+            app.main(['_watch', 'id-2'])
+        self.assertEqual(calls, [('abc123', 'id-1'), (app.LEGACY, 'id-2')])
+
+    def test_install_refuses_while_any_connection_runs(self):
+        self.connection(host='me@nexcom23')
+        with patch.object(self.c, 'service_active', return_value=False):
+            with self.assertRaisesRegex(RuntimeError, 'Stop shared access'):
+                self.c.install()
 
     def bootstrap(self, browser=False, path=None):
         executable = self.home / '.local/bin/claude'

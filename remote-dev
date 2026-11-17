@@ -4,6 +4,7 @@
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,12 +17,16 @@ import stat
 import subprocess
 import sys
 import time
+import types
 import urllib.request
 import uuid
 
 
 UNIT = 'remote-dev.service'
-WATCH_UNIT = 'remote-dev-link.service'
+WATCH_UNIT = 'remote-dev-link.service'  # single-connection watcher of earlier versions
+LEGACY = 'legacy'
+OAUTH_FORWARD = ('-L', '127.0.0.1:8765:127.0.0.1:8765')
+BROWSER_FORWARD = ('-R', '127.0.0.1:9222:127.0.0.1:9222')
 MARKER = '# Managed by remote-dev.'
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
@@ -183,27 +188,66 @@ def reap(child):
             child.wait()
 
 
+def target_key(host, port):
+    return hashlib.sha256(('%s:%d' % (host, port)).encode()).hexdigest()[:12]
+
+
+def describe(values):
+    return '%s:%d' % (values['host'], values['ssh_port'])
+
+
+def split_target(host):
+    user, _, name = host.rpartition('@')
+    return user, name.strip('[]')
+
+
+def match_targets(query, candidates):
+    """Exact target first, otherwise a unique hostname-prefix match (user must match when given)."""
+    exact = [item for item in candidates if item['host'] == query]
+    if exact:
+        return exact
+    user, name = split_target(query)
+    return [item for item in candidates
+            if split_target(item['host'])[1].startswith(name)
+            and (not user or split_target(item['host'])[0] == user)]
+
+
+def ambiguous(query, found):
+    return RuntimeError('%s matches several targets: %s; use a longer --host'
+                        % (query, ', '.join(describe(item) for item in found)))
+
+
 class Controller:
     def __init__(self, home=None, runtime_dir=None):
         self.home = Path(home or Path.home())
         self.data = self.home / '.local/share/remote-dev'
         self.config_dir = self.home / '.config/remote-dev/devspace'
         self.config_file = self.config_dir / 'config.jsonc'
+        self.targets_file = self.home / '.config/remote-dev/targets.json'
         self.unit_file = self.home / '.config/systemd/user' / UNIT
         self.runtime = Path(runtime_dir or Path(os.environ.get('XDG_RUNTIME_DIR',
                               '/run/user/' + str(os.getuid()))))
         if runtime_dir is None:
             self.runtime = self.runtime / 'remote-dev'
-        self.connection_file = self.runtime / 'connection.json'
+        self.connections_dir = self.runtime / 'connections'
+        self.shared_file = self.runtime / 'shared.json'
         self.sessions_dir = self.runtime / 'sessions'
-        self.ssh_socket = self.runtime / 'ssh.sock'
-        self.clipboard_socket = self.runtime / 'clipboard.sock'
         self.browser = Browser(self.home)
+
+    def paths(self, key):
+        if key == LEGACY:
+            base, unit, lock = self.runtime, WATCH_UNIT, 'startup.lock'
+        else:
+            base, unit, lock = self.connections_dir / key, 'remote-dev-link-%s.service' % key, 'locks/%s.lock' % key
+        return types.SimpleNamespace(dir=base, connection=base / 'connection.json', ssh=base / 'ssh.sock',
+                                     clipboard=base / 'clipboard.sock', unit=unit, lock=lock)
 
     @contextlib.contextmanager
     def lock(self, name='control.lock', nonblocking=False):
+        path = self.runtime / name
         private_dir(self.runtime)
-        with (self.runtime / name).open('a') as stream:
+        private_dir(path.parent)
+        with path.open('a') as stream:
             os.chmod(stream.name, 0o600)
             try:
                 fcntl.flock(stream, fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0))
@@ -211,14 +255,101 @@ class Controller:
                 raise BusyError('Another remote-dev operation is starting; inspect status before retrying') from error
             yield
 
-    def read_connection(self):
+    def read_connection(self, key):
         try:
-            return json.loads(self.connection_file.read_text())
+            value = json.loads(self.paths(key).connection.read_text())
         except FileNotFoundError:
             return None
+        value['key'] = key
+        return value
 
     def write_connection(self, value):
-        atomic_json(self.connection_file, value)
+        atomic_json(self.paths(value['key']).connection, value)
+
+    def connections(self):
+        found = [value for value in [self.read_connection(LEGACY)] if value]
+        if self.connections_dir.is_dir():
+            for directory in sorted(self.connections_dir.iterdir()):
+                value = self.read_connection(directory.name)
+                if value:
+                    found.append(value)
+        return sorted(found, key=lambda item: (item['host'], item['ssh_port']))
+
+    def read_shared(self):
+        try:
+            return json.loads(self.shared_file.read_text())
+        except FileNotFoundError:
+            return {}
+
+    def write_shared(self, value):
+        value = {key: item for key, item in value.items() if item}
+        if value:
+            atomic_json(self.shared_file, value)
+        else:
+            self.shared_file.unlink(missing_ok=True)
+
+    def read_targets(self):
+        try:
+            targets = json.loads(self.targets_file.read_text()).get('targets', [])
+        except FileNotFoundError:
+            return []
+        return sorted(targets, key=lambda item: item.get('last_used', 0), reverse=True)
+
+    def remember(self, values):
+        with self.lock():
+            targets = [item for item in self.read_targets()
+                       if (item['host'], item['ssh_port']) != (values['host'], values['ssh_port'])]
+            targets.insert(0, {'host': values['host'], 'ssh_port': values['ssh_port'],
+                               'identity_file': values.get('identity_file'), 'last_used': int(time.time())})
+            atomic_json(self.targets_file, {'targets': targets})
+
+    def resolve_start(self, host, port, identity_file):
+        active = self.connections()
+        note = None
+        if host is None:
+            if len(active) == 1:
+                base, note = active[0], 'running connection'
+            elif active:
+                raise RuntimeError('Several connections are running: %s; pass --host'
+                                   % ', '.join(describe(item) for item in active))
+            else:
+                targets = self.read_targets()
+                if not targets:
+                    raise RuntimeError('No previous target is remembered; pass --host USER@HOST')
+                base, note = targets[0], 'last used'
+        else:
+            candidates = {}
+            for item in active + self.read_targets():
+                candidates.setdefault((item['host'], item['ssh_port']), item)
+            candidates = [item for item in candidates.values() if port is None or item['ssh_port'] == port]
+            found = match_targets(host, candidates)
+            if len(found) > 1:
+                raise ambiguous(host, found)
+            if found:
+                base = found[0]
+                note = None if base['host'] == host else 'matched "%s"' % host
+            else:
+                validate_host(host)
+                base = {'host': host, 'ssh_port': 22, 'identity_file': None}
+        return {'host': base['host'], 'ssh_port': base['ssh_port'] if port is None else port,
+                'identity_file': identity_file or base.get('identity_file'), 'note': note}
+
+    def resolve_active(self, host=None):
+        active = self.connections()
+        query = host or os.environ.get('REMOTE_DEV_HOST')
+        if query:
+            found = match_targets(query, active)
+            if not found:
+                raise RuntimeError('No running connection matches %s; run remote-dev start --host %s' % (query, query))
+            if len(found) > 1:
+                raise ambiguous(query, found)
+            return found[0]
+        if not active:
+            raise RuntimeError('Run remote-dev start --host USER@HOST first')
+        if len(active) > 1:
+            raise RuntimeError('Several connections are running: %s; pass --host or set REMOTE_DEV_HOST'
+                               % ', '.join(describe(item) for item in active))
+        return active[0]
 
     def read_config(self):
         try:
@@ -238,30 +369,30 @@ class Controller:
         return provisioning.install(self, ROOT, host, port, identity_file, browser, install_node)
 
     def uninstall(self, host=None, port=22, identity_file=None):
-        self.stop()
+        self.stop(everything=True)
         return provisioning.uninstall(self, ROOT, host, port, identity_file)
 
     def master_command(self, values):
-        args = ['ssh', '-M', '-S', str(self.ssh_socket), '-fNT',
+        paths = self.paths(values['key'])
+        args = ['ssh', '-M', '-S', str(paths.ssh), '-fNT',
                 '-o', 'ControlPersist=no',
                 '-o', 'ExitOnForwardFailure=yes',
                 '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2',
                 '-R', '127.0.0.1:7676:127.0.0.1:7676',
-                '-R', '127.0.0.1:%d:%s' % (clipboard.PORT, self.clipboard_socket),
-                '-L', '127.0.0.1:8765:127.0.0.1:8765']
+                '-R', '127.0.0.1:%d:%s' % (clipboard.PORT, paths.clipboard)]
         if values['browser']:
-            args += ['-R', '127.0.0.1:9222:127.0.0.1:9222']
+            args += list(BROWSER_FORWARD)
         args += ssh_options(values['ssh_port'], values.get('identity_file'))
         return args + [values['host']]
 
     def channel_command(self, values, command, tty=True):
-        return ['ssh', '-t' if tty else '-T', '-S', str(self.ssh_socket),
+        return ['ssh', '-t' if tty else '-T', '-S', str(self.paths(values['key']).ssh),
                 '-p', str(values['ssh_port']), '-o', 'ControlMaster=no',
                 '-o', 'ProxyCommand=false', '-o', 'BatchMode=yes',
                 '-o', 'ForwardAgent=no', values['host'], command]
 
     def control(self, values, action, *args):
-        return subprocess.run(['ssh', '-S', str(self.ssh_socket), '-O', action,
+        return subprocess.run(['ssh', '-S', str(self.paths(values['key']).ssh), '-O', action,
             *args, '-p', str(values['ssh_port']), '-o', 'BatchMode=yes', values['host']],
             capture_output=True, text=True, timeout=5)
 
@@ -289,23 +420,31 @@ class Controller:
         subprocess.run(self.channel_command(values, remote_command('prepare', browser=browser), tty=False),
                        input=request, text=True, check=True)
 
+    def acquire_browser(self, shared):
+        """Start or borrow Chrome; ownership survives only while the same session file is current."""
+        acquired = self.browser.start()
+        shared['browser_owned'] = acquired['created_browser'] or (
+            shared.get('browser_owned', False) and shared.get('browser_stamp') == acquired['session_stamp'])
+        shared['browser_stamp'] = acquired['session_stamp']
+        return acquired
+
     def enable_browser(self, values):
+        if values['key'] == LEGACY:
+            raise RuntimeError('This connection was started by an older remote-dev; run stop, then start with --browser')
         self.prepare(values, True)
-        forward = ('-R', '127.0.0.1:9222:127.0.0.1:9222')
         updated = dict(values)
+        before = self.read_shared()
+        shared = dict(before)
         cancel_forward = recorded = False
         acquired = None
         try:
             with defer_signals():
-                acquired = self.browser.start()
-                updated['browser_owned'] = acquired['created_browser'] or (
-                    values.get('browser_owned', False) and values.get('browser_stamp') == acquired['session_stamp'])
-                updated['browser_stamp'] = acquired['session_stamp']
-                self.write_connection(updated)
+                acquired = self.acquire_browser(shared)
                 recorded = True
+                self.write_shared(shared)
                 if not values['browser']:
                     cancel_forward = True
-                    result = self.control(values, 'forward', *forward)
+                    result = self.control(values, 'forward', *BROWSER_FORWARD)
                     if result.returncode:
                         cancel_forward = False
                         raise RuntimeError('Browser forwarding failed: ' + result.stderr.strip())
@@ -314,25 +453,79 @@ class Controller:
         except BaseException:
             with defer_signals():
                 if cancel_forward:
-                    result = self.control(values, 'cancel', *forward)
+                    result = self.control(values, 'cancel', *BROWSER_FORWARD)
                     if result.returncode:
                         raise RuntimeError('Browser forwarding rollback failed; inspect status and retry stop: '
                                            + result.stderr.strip())
                 if acquired and acquired['created_browser']:
                     self.browser.stop(expected_stamp=acquired['session_stamp'])
                 if recorded:
+                    self.write_shared(before)
                     self.write_connection(values)
             raise
 
-    def start(self, host, port, browser, identity_file=None):
+    def forward_oauth(self, values):
+        """Best effort: the first connection gets the local OAuth callback; others use remote-dev auth."""
+        shared = self.read_shared()
+        holder = shared.get('oauth_holder')
+        if holder and holder != values['key'] and self.read_connection(holder):
+            print('OAuth callback 8765 stays with %s; run remote-dev auth --host %s before a local-dev login.'
+                  % (describe(self.read_connection(holder)), values['host']), flush=True)
+            return
+        try:
+            result = self.control(values, 'forward', *OAUTH_FORWARD)
+        except subprocess.TimeoutExpired:
+            result = None
+        if result is None or result.returncode:
+            print('Warning: local port 8765 could not be forwarded; local-dev login needs it. '
+                  'Free it, then run remote-dev auth --host ' + values['host'], file=sys.stderr, flush=True)
+            return
+        shared['oauth_holder'] = values['key']
+        self.write_shared(shared)
+
+    def auth(self, host=None):
+        with self.lock():
+            values = self.resolve_active(host)
+            if not self.connection_ready(values):
+                raise RuntimeError('Connection to %s is not ready; inspect remote-dev status' % describe(values))
+            shared = self.read_shared()
+            holder = shared.get('oauth_holder')
+            if values['key'] == LEGACY or holder == values['key']:
+                print('OAuth callback 8765 already forwards to ' + describe(values) + '.')
+                return
+            previous = self.read_connection(holder) if holder else None
+            if previous:
+                self.control(previous, 'cancel', *OAUTH_FORWARD)
+            shared.pop('oauth_holder', None)
+            self.write_shared(shared)
+            result = self.control(values, 'forward', *OAUTH_FORWARD)
+            if result.returncode:
+                if previous and self.control(previous, 'forward', *OAUTH_FORWARD).returncode == 0:
+                    shared['oauth_holder'] = previous['key']
+                    self.write_shared(shared)
+                raise RuntimeError('Local port 8765 could not be forwarded; check for another listener: '
+                                   + result.stderr.strip())
+            shared['oauth_holder'] = values['key']
+            self.write_shared(shared)
+        print('OAuth callback 8765 now forwards to %s. Log in to local-dev from a Claude session there.'
+              % describe(values))
+
+    def start(self, host=None, port=None, browser=False, identity_file=None):
+        with self.lock():
+            target = self.resolve_start(host, port, identity_file)
+        host, port, identity_file = target['host'], target['ssh_port'], target['identity_file']
         validate_host(host)
         ssh_options(port, identity_file)
         identity_file = str(Path(identity_file).expanduser().resolve()) if identity_file else None
-        with self.lock('startup.lock', nonblocking=True):
+        if target['note']:
+            print('Target %s:%d (%s).' % (host, port, target['note']), flush=True)
+        key = target_key(host, port)
+        paths = self.paths(key)
+        with self.lock(paths.lock, nonblocking=True):
             values, child, started = None, None, False
             try:
                 with self.lock():
-                    existing = self.read_connection()
+                    existing = self.read_connection(key)
                     if existing:
                         current = (existing['host'], existing['ssh_port'], existing.get('identity_file'))
                         if (current == (host, port, identity_file) and (browser or not existing['browser'])
@@ -342,39 +535,54 @@ class Controller:
                             print('Shared connection and browser are ready.' if browser
                                   else 'Shared connection is already running.')
                             return
-                        raise RuntimeError('A connection is recorded; inspect status and run stop before changing it')
-                    if self.service_active() or self.ssh_socket.exists():
+                        raise RuntimeError('A connection to %s is recorded; inspect status and stop it before changing it'
+                                           % describe(existing))
+                    active = self.connections()
+                    legacy = [item for item in active if item['key'] == LEGACY]
+                    if legacy:
+                        if (legacy[0]['host'], legacy[0]['ssh_port']) == (host, port):
+                            if browser:
+                                self.enable_browser(legacy[0])
+                            print('Shared connection is already running.')
+                            return
+                        raise RuntimeError('A connection from an older remote-dev is running; run remote-dev stop first')
+                    shared = self.read_shared()
+                    service = self.service_active()
+                    if service and not active and not shared.get('devspace_owned'):
                         raise RuntimeError('Untracked access exists; inspect status and run stop first')
+                    self.remove_stale_socket(paths.ssh)
                     if not self.config_file.exists():
                         raise RuntimeError('Run remote-dev install first')
                     config = self.read_config()
                     scope = canonical_paths(config.get('workspaces', {}).get('allowedRoots', []))
-                    require_free_port(7676)
-                    require_free_port(8765)
-                    values = {'id': str(uuid.uuid4()), 'phase': 'starting', 'host': host,
+                    if not service:
+                        require_free_port(7676)
+                    values = {'id': str(uuid.uuid4()), 'key': key, 'phase': 'starting', 'host': host,
                               'ssh_port': port, 'scope': scope, 'browser': browser,
                               'identity_file': identity_file, 'clipboard_token': secrets.token_hex(16),
-                              'controller': process_record(os.getpid()), 'service_owned': True,
-                              'browser_owned': False, 'watcher_owned': False}
+                              'controller': process_record(os.getpid()), 'watcher_owned': False}
                     self.write_connection(values)
-                    self.systemctl('start')
+                    if not service:
+                        shared['devspace_owned'] = True
+                        self.write_shared(shared)
+                        self.systemctl('start')
                     self.wait_health()
                     if browser:
                         with defer_signals():
-                            acquired = self.browser.start()
-                            values['browser_owned'] = acquired['created_browser']
-                            values['browser_stamp'] = acquired['session_stamp']
-                            self.write_connection(values)
-                    print('Host DevSpace ready. Connecting to ' + host + '.', flush=True)
+                            shared = self.read_shared()
+                            self.acquire_browser(shared)
+                            self.write_shared(shared)
+                    print('Host DevSpace ready. Connecting to ' + describe(values) + '.', flush=True)
                     with defer_signals() as previous_mask:
                         child = subprocess.Popen(self.master_command(values),
                             preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask))
                         values['ssh'] = process_record(child.pid)
                         self.write_connection(values)
                 if child.wait() != 0:
-                    raise RuntimeError('SSH startup failed; check authentication and forwarding ports')
+                    raise RuntimeError('SSH startup failed; check authentication and forwarding ports. If this server '
+                                       'is already connected under another name or user, its ports 7676/7677 are taken')
                 with self.lock():
-                    if not self.read_connection():
+                    if not self.read_connection(key):
                         raise RuntimeError('Startup was stopped')
                     check = self.control(values, 'check')
                     match = re.search(r'pid=(\d+)', check.stdout + check.stderr)
@@ -384,37 +592,39 @@ class Controller:
                     self.write_connection(values)
                 self.prepare(values, browser)
                 with self.lock():
-                    if not self.read_connection():
+                    if not self.read_connection(key):
                         raise RuntimeError('Startup was stopped')
+                    self.forward_oauth(values)
                     values['phase'] = 'ready'
                     values['controller'] = None
                     self.write_connection(values)
                     with defer_signals():
                         subprocess.run(['systemd-run', '--user', '--quiet', '--collect',
-                            '--unit=' + WATCH_UNIT, '--property=Restart=no',
+                            '--unit=' + paths.unit, '--property=Restart=no',
                             '--property=KillMode=control-group', '--property=TimeoutStopSec=10',
-                            sys.executable, str(Path(__file__).resolve()), '_watch', values['id']], check=True)
+                            sys.executable, str(Path(__file__).resolve()), '_watch', key, values['id']], check=True)
                         values['watcher_owned'] = True
                         self.write_connection(values)
+                self.remember(values)
                 started = True
-                print('Shared connection ready. Run remote-dev open in any project terminal.')
+                print('Shared connection to %s ready. Run remote-dev open in any project terminal.' % describe(values))
             finally:
                 reap(child)
                 if values and not started:
-                    self.cleanup(values['id'], acquired=values)
+                    self.cleanup(key, values['id'], acquired=values)
                     if values.get('watcher_owned'):
-                        self.systemctl('stop', unit=WATCH_UNIT, check=False)
+                        self.systemctl('stop', unit=paths.unit, check=False)
 
-    def open(self, paths, client='claude'):
+    def open(self, paths, client='claude', host=None):
         if client != 'claude':
             raise ValueError('Codex is planned; only Claude is implemented')
         paths = canonical_paths(paths or [Path.cwd()])
         identifier, child = str(uuid.uuid4()), None
         try:
             with self.lock():
-                values = self.read_connection()
-                if not values or not self.connection_ready(values):
-                    raise RuntimeError('Run remote-dev start --host USER@HOST first')
+                values = self.resolve_active(host)
+                if not self.connection_ready(values):
+                    raise RuntimeError('Connection to %s is not ready; inspect remote-dev status' % describe(values))
                 for path in paths:
                     if not any(within(path, base) for base in values['scope']):
                         raise ValueError('Path is outside configured development roots: ' + path +
@@ -424,9 +634,9 @@ class Controller:
                     child = subprocess.Popen(self.channel_command(values, command),
                         preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask))
                     atomic_json(self.sessions_dir / (identifier + '.json'), {
-                        'id': identifier, 'client': client, 'paths': paths,
+                        'id': identifier, 'client': client, 'connection': values['key'], 'paths': paths,
                         'ssh': process_record(child.pid)})
-            print('Claude session ' + identifier[:8] + ': ' + ', '.join(paths), flush=True)
+            print('Claude session %s on %s: %s' % (identifier[:8], describe(values), ', '.join(paths)), flush=True)
             code = child.wait()
             if code == 255:
                 restore_terminal()
@@ -445,116 +655,172 @@ class Controller:
                 pass
         return records
 
-    def cleanup(self, identifier, acquired=None):
+    def cleanup(self, key, identifier, acquired=None):
         with self.lock():
-            values = self.read_connection()
+            paths = self.paths(key)
+            values = self.read_connection(key)
             if acquired and (not values or values.get('id') == identifier):
                 values = acquired
             if not values or values.get('id') != identifier:
                 return
             errors = []
             try:
-                if self.ssh_socket.exists():
+                if paths.ssh.exists():
                     self.control(values, 'exit')
                 terminate(values.get('ssh'))
                 for path, session in self.sessions():
-                    terminate(session.get('ssh'))
-                    path.unlink(missing_ok=True)
+                    if session.get('connection', LEGACY) == key:
+                        terminate(session.get('ssh'))
+                        path.unlink(missing_ok=True)
             except (OSError, subprocess.SubprocessError) as error:
                 errors.append(str(error))
-            if values.get('service_owned'):
-                try:
-                    self.systemctl('stop')
-                except subprocess.SubprocessError as error:
-                    errors.append(str(error))
-            if values.get('browser_owned'):
-                try:
-                    self.browser.stop(expected_stamp=values['browser_stamp'])
-                except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-                    errors.append(str(error))
             if errors:
                 raise RuntimeError('Cleanup incomplete; retry stop: ' + '; '.join(errors))
-            self.connection_file.unlink(missing_ok=True)
-            self.ssh_socket.unlink(missing_ok=True)
-            self.clipboard_socket.unlink(missing_ok=True)
+            if key == LEGACY:
+                shared = self.read_shared()
+                if values.get('service_owned'):
+                    shared['devspace_owned'] = True
+                if values.get('browser_owned'):
+                    shared.update(browser_owned=True, browser_stamp=values.get('browser_stamp'))
+                self.write_shared(shared)
+            paths.connection.unlink(missing_ok=True)
+            paths.ssh.unlink(missing_ok=True)
+            paths.clipboard.unlink(missing_ok=True)
+            if key != LEGACY:
+                with contextlib.suppress(OSError):
+                    paths.dir.rmdir()
+            self.release_shared()
 
-    def remove_stale_socket(self):
+    def release_shared(self):
+        """Stop owned DevSpace/Chrome once no remaining connection uses them. Call under the control lock."""
+        remaining = self.connections()
+        shared = self.read_shared()
+        errors = []
+        if shared.get('oauth_holder') not in [item['key'] for item in remaining]:
+            shared.pop('oauth_holder', None)
+        if shared.get('devspace_owned') and not remaining:
+            try:
+                self.systemctl('stop')
+                shared.pop('devspace_owned')
+            except subprocess.SubprocessError as error:
+                errors.append(str(error))
+        if shared.get('browser_owned') and not any(item.get('browser') for item in remaining):
+            try:
+                self.browser.stop(expected_stamp=shared.get('browser_stamp'))
+                shared.pop('browser_owned')
+                shared.pop('browser_stamp', None)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                errors.append(str(error))
+        self.write_shared(shared)
+        if errors:
+            raise RuntimeError('Cleanup incomplete; retry stop: ' + '; '.join(errors))
+
+    @staticmethod
+    def remove_stale_socket(path):
         try:
-            mode = self.ssh_socket.lstat().st_mode
+            mode = path.lstat().st_mode
         except FileNotFoundError:
             return
         if not stat.S_ISSOCK(mode):
-            raise RuntimeError('Unexpected file at SSH control socket path; inspect ' + str(self.ssh_socket))
+            raise RuntimeError('Unexpected file at SSH control socket path; inspect ' + str(path))
         with socket.socket(socket.AF_UNIX) as probe:
             probe.settimeout(1)
             try:
-                probe.connect(str(self.ssh_socket))
+                probe.connect(str(path))
             except ConnectionRefusedError:
-                self.ssh_socket.unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
                 return
             except FileNotFoundError:
                 return
-        raise RuntimeError('Untracked SSH control socket is active; inspect ' + str(self.ssh_socket))
+        raise RuntimeError('Untracked SSH control socket is active; inspect ' + str(path))
 
-    def stop(self):
+    def stop_connection(self, key):
+        paths = self.paths(key)
         while True:
             with self.lock():
-                values = self.read_connection()
+                values = self.read_connection(key)
                 if values and values.get('phase') == 'starting' and same_process(values.get('controller')):
                     if values['controller']['pid'] != os.getpid():
                         os.kill(values['controller']['pid'], signal.SIGTERM)
             try:
-                with self.lock('startup.lock', nonblocking=True):
-                    values = self.read_connection()
+                with self.lock(paths.lock, nonblocking=True):
+                    values = self.read_connection(key)
                     if values:
-                        self.cleanup(values['id'])
+                        self.cleanup(key, values['id'])
                         if values.get('watcher_owned'):
-                            self.systemctl('stop', unit=WATCH_UNIT, check=False)
-                    else:
-                        self.remove_stale_socket()
-                        if self.service_active():
-                            if not self.unit_file.read_text().startswith(MARKER):
-                                raise RuntimeError('The service unit is not managed by remote-dev')
-                            self.systemctl('stop')
-                    print('Stopped. Authentication, profiles and project workloads are preserved.')
+                            self.systemctl('stop', unit=paths.unit, check=False)
+                        print('Stopped ' + describe(values) + '.', flush=True)
                     return
             except BusyError:
                 time.sleep(0.05)
 
-    def watch(self, identifier):
+    def stop(self, host=None, everything=False):
+        with self.lock():
+            active = self.connections()
+            if everything:
+                selected = active
+            elif active or host or os.environ.get('REMOTE_DEV_HOST'):
+                selected = [self.resolve_active(host)]
+            else:
+                selected = []
+        for values in selected:
+            self.stop_connection(values['key'])
+        with self.lock():
+            if not self.connections():
+                self.remove_stale_socket(self.paths(LEGACY).ssh)
+                if self.connections_dir.is_dir():
+                    for directory in self.connections_dir.iterdir():
+                        self.remove_stale_socket(directory / 'ssh.sock')
+                        with contextlib.suppress(OSError):
+                            directory.rmdir()
+                owned = self.read_shared().get('devspace_owned')
+                self.release_shared()
+                if not selected and not owned and self.service_active():
+                    if not self.unit_file.read_text().startswith(MARKER):
+                        raise RuntimeError('The service unit is not managed by remote-dev')
+                    self.systemctl('stop')
+        print('Stopped. Authentication, profiles and project workloads are preserved.')
+
+    def watch(self, key, identifier):
         server = None
         try:
             while True:
                 with self.lock():
-                    values = self.read_connection()
+                    values = self.read_connection(key)
                     if not values or values['id'] != identifier:
                         return
                     if not self.connection_ready(values):
                         break
                     if server is None and values.get('clipboard_token'):
                         with contextlib.suppress(OSError):  # Image paste is optional; retry next round.
-                            server = clipboard.serve(self.clipboard_socket, values['clipboard_token'])
+                            server = clipboard.serve(self.paths(key).clipboard, values['clipboard_token'])
                 time.sleep(2)
         finally:
             if server:
                 server.close()
-            self.cleanup(identifier)
+            self.cleanup(key, identifier)
 
-    def status(self):
-        values = self.read_connection()
+    def status(self, host=None):
+        selected = [self.resolve_active(host)] if host else self.connections()
         service = self.service_active()
-        ssh = bool(values and self.control(values, 'check').returncode == 0)
-        browser = False
-        if values and values.get('browser'):
-            browser = self.browser.status()['chrome_running']
-        sessions = [{'id': record['id'], 'client': record['client'], 'paths': record['paths'],
-                     'running': same_process(record.get('ssh'))} for _, record in self.sessions()]
-        return {'running': bool(values and values.get('phase') == 'ready' and service and ssh),
-                'service_running': service, 'ssh_running': ssh,
-                'browser_requested': bool(values and values.get('browser')),
-                'browser_running': browser, 'host': values.get('host') if values else None,
-                'development_roots': values.get('scope', []) if values else [],
-                'sessions': sessions, 'active_sessions': sum(item['running'] for item in sessions),
+        shared = self.read_shared()
+        browser = bool(any(item.get('browser') for item in selected) and self.browser.status()['chrome_running'])
+        sessions = self.sessions()
+        items = []
+        for values in selected:
+            ssh = self.control(values, 'check').returncode == 0
+            owned = [{'id': record['id'], 'client': record['client'], 'paths': record['paths'],
+                      'running': same_process(record.get('ssh'))}
+                     for _, record in sessions if record.get('connection', LEGACY) == values['key']]
+            items.append({'host': values['host'], 'ssh_port': values['ssh_port'], 'key': values['key'],
+                          'running': values.get('phase') == 'ready' and service and ssh,
+                          'ssh_running': ssh, 'browser_requested': bool(values.get('browser')),
+                          'oauth_callback': values['key'] in (LEGACY, shared.get('oauth_holder')),
+                          'development_roots': values.get('scope', []), 'sessions': owned,
+                          'active_sessions': sum(item['running'] for item in owned)})
+        return {'running': any(item['running'] for item in items), 'service_running': service,
+                'browser_running': browser, 'connections': items,
+                'active_sessions': sum(item['active_sessions'] for item in items),
                 'authentication': 'Check local-dev in Claude /mcp; not inferred from health.'}
 
 
@@ -563,9 +829,10 @@ def parser():
     commands = result.add_subparsers(dest='command', required=True)
     prepared = commands.add_parser('install', help='Install local dependencies and configure an optional remote server')
     removed = commands.add_parser('uninstall', help='Remove owned installation resources, preserving user data')
-    start = commands.add_parser('start', help='Start shared access without launching Claude')
-    start.add_argument('--host', required=True, help='Explicit SSH target: [USER@]HOST')
-    start.add_argument('--ssh-port', type=int, default=22)
+    start = commands.add_parser('start', help='Start shared access to a remote server without launching Claude')
+    start.add_argument('-H', '--host', help='SSH target [USER@]HOST, or a hostname prefix of a remembered target; '
+                                            'default: the running connection or the last target')
+    start.add_argument('--ssh-port', type=int, help='Default: remembered port or 22')
     start.add_argument('--browser', action='store_true', help='Start or borrow dedicated local Chrome')
     for command in [prepared, removed]:
         command.add_argument('--host', help='Optional remote SSH target: [USER@]HOST')
@@ -574,13 +841,34 @@ def parser():
         command.add_argument('-i', '--identity-file', help='Local SSH private key; never copied remotely')
     prepared.add_argument('--browser', action='store_true', help='Prepare local Chrome and remote browser MCP')
     prepared.add_argument('--with-node', dest='install_node', action='store_true', help='Install private Node24 if no compatible runtime exists')
+    selector = 'Running connection: exact target or hostname prefix; default: REMOTE_DEV_HOST or the only connection'
     opened = commands.add_parser('open', help='Open an independent Claude session; default directory is cwd')
     opened.add_argument('paths', nargs='*', help='Local repository directories')
+    opened.add_argument('-H', '--host', help=selector)
     opened.add_argument('--client', choices=['claude'], default='claude', help='Default: claude; Codex is planned')
     status = commands.add_parser('status', help='Inspect shared access and individual sessions')
+    status.add_argument('-H', '--host', help='Show one running connection; default: all')
     status.add_argument('--json', action='store_true')
-    commands.add_parser('stop', help='Close shared access and all managed sessions')
+    stopped = commands.add_parser('stop', help='Close a connection and its sessions')
+    stopped.add_argument('-H', '--host', help=selector)
+    stopped.add_argument('--all', action='store_true', help='Close every connection')
+    auth = commands.add_parser('auth', help='Forward the local OAuth callback port 8765 to a connection')
+    auth.add_argument('-H', '--host', help=selector)
     return result
+
+
+def print_status(status):
+    print('Connection: ' + ('running' if status['running'] else 'stopped or partial'))
+    print('DevSpace: ' + ('running' if status['service_running'] else 'stopped'))
+    for connection in status['connections']:
+        print('%s:%d %s%s%s' % (connection['host'], connection['ssh_port'],
+            'running' if connection['running'] else 'partial',
+            ', browser' if connection['browser_requested'] else '',
+            ', OAuth callback' if connection['oauth_callback'] else ''))
+        for item in connection['sessions']:
+            print('  %s %s %s: %s' % (item['id'][:8], item['client'],
+                'running' if item['running'] else 'stale', ', '.join(item['paths'])))
+    print('Active sessions: ' + str(status['active_sessions']))
 
 
 def main(argv=None):
@@ -592,7 +880,8 @@ def main(argv=None):
                 for number in [signal.SIGTERM, signal.SIGHUP]}
     try:
         if argv[:1] == ['_watch']:
-            controller.watch(argv[1])
+            key, identifier = argv[1:] if len(argv) == 3 else (LEGACY, argv[1])
+            controller.watch(key, identifier)
             return 0
         args = parser().parse_args(argv)
         if args.command == 'install':
@@ -602,20 +891,17 @@ def main(argv=None):
         elif args.command == 'uninstall':
             controller.uninstall(args.host, args.ssh_port, args.identity_file)
         elif args.command == 'open':
-            return controller.open(args.paths, args.client)
+            return controller.open(args.paths, args.client, args.host)
         elif args.command == 'stop':
-            controller.stop()
+            controller.stop(args.host, args.all)
+        elif args.command == 'auth':
+            controller.auth(args.host)
         else:
-            status = controller.status()
+            status = controller.status(args.host)
             if args.json:
                 print(json.dumps(status, indent=2))
             else:
-                print('Connection: ' + ('running' if status['running'] else 'stopped or partial'))
-                print('Host: ' + str(status['host']))
-                for item in status['sessions']:
-                    print('%s %s %s: %s' % (item['id'][:8], item['client'],
-                        'running' if item['running'] else 'stale', ', '.join(item['paths'])))
-                print('Active sessions: ' + str(status['active_sessions']))
+                print_status(status)
             return 0 if status['running'] else 1
         return 0
     except KeyboardInterrupt:
