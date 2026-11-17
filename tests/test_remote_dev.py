@@ -616,7 +616,7 @@ class CliTests(unittest.TestCase):
 
     def test_remember_upserts_most_recent_target(self):
         self.remembered(('user@host', 22, None, 1), ('me@nexcom23', 22, None, 2))
-        self.c.remember({'host': 'user@host', 'ssh_port': 22, 'identity_file': '/k'})
+        self.c.remember('user@host', 22, '/k')
         targets = self.c.read_targets()
         self.assertEqual([(t['host'], t['identity_file']) for t in targets], [('user@host', '/k'), ('me@nexcom23', None)])
         self.assertEqual(self.c.targets_file.stat().st_mode & 0o777, 0o600)
@@ -727,10 +727,10 @@ class CliTests(unittest.TestCase):
 
     def test_successful_start_forwards_oauth_once_and_remembers_target(self):
         self.start_fixture()
-        actions = []
+        actions, master = [], self.child()
         def control(values, action, *args):
             actions.append((values['host'], action) + args)
-            return subprocess.CompletedProcess([], 0, 'Master running (pid=%d)' % os.getpid(), '')
+            return subprocess.CompletedProcess([], 0, 'Master running (pid=%d)' % master.pid, '')
         def run(args, **kwargs):
             return subprocess.CompletedProcess(args, 0, '', '')
         with patch.object(self.c, 'systemctl', side_effect=self.ok), \
@@ -857,6 +857,188 @@ class CliTests(unittest.TestCase):
         with patch.object(self.c, 'service_active', return_value=False):
             with self.assertRaisesRegex(RuntimeError, 'Stop shared access'):
                 self.c.install()
+
+    def test_prefix_does_not_continue_digits_or_match_empty_hostnames(self):
+        items = [{'host': 'me@10.0.0.12', 'ssh_port': 22}, {'host': 'server10', 'ssh_port': 22},
+                 {'host': 'deploy@prod-db', 'ssh_port': 22}]
+        self.assertEqual(app.match_targets('10.0.0.1', items), [])
+        self.assertEqual(app.match_targets('server1', items), [])
+        self.assertEqual(app.match_targets('me@', items), [])
+        self.assertEqual(app.match_targets('server', items), [items[1]])
+        self.assertEqual(app.match_targets('prod', items), [items[2]])
+        self.assertEqual(app.match_targets('=prod', items), [], '= disables prefix matching')
+
+    def test_start_uses_new_literal_targets_instead_of_longer_remembered_names(self):
+        self.remembered(('me@10.0.0.12', 22, '/k', 1), ('server10', 22, None, 2), ('deploy@prod-db', 22, None, 3))
+        self.assertEqual(self.c.resolve_start('10.0.0.1', None, None)['host'], '10.0.0.1')
+        self.assertEqual(self.c.resolve_start('server1', None, None)['host'], 'server1')
+        self.assertEqual(self.c.resolve_start('prod', None, None)['host'], 'deploy@prod-db')
+        literal = self.c.resolve_start('=prod', None, None)
+        self.assertEqual((literal['host'], literal['identity_file'], literal['note']), ('prod', None, None))
+        self.assertEqual(self.c.resolve_start('=server10', None, None)['host'], 'server10')
+
+    def test_host_port_selects_between_connections_on_one_host(self):
+        self.connection(host='me@gw', ssh_port=2201)
+        self.connection(id='other', host='me@gw', ssh_port=2202)
+        with self.assertRaisesRegex(RuntimeError, 'HOST:PORT'):
+            self.c.resolve_active('gw')
+        self.assertEqual(self.c.resolve_active('gw:2202')['ssh_port'], 2202)
+        self.assertEqual(self.c.resolve_active('me@gw:2201')['ssh_port'], 2201)
+        started = self.c.resolve_start('gw:2202', None, None)
+        self.assertEqual((started['host'], started['ssh_port']), ('me@gw', 2202))
+        self.assertEqual(self.c.resolve_start('new:2022', None, None)['ssh_port'], 2022)
+        with self.assertRaisesRegex(ValueError, 'disagree'):
+            self.c.resolve_start('gw:2202', 2201, None)
+        self.assertEqual(app.parse_query('[::1]:2200'), ('[::1]', 2200, False))
+        self.assertEqual(app.parse_query('fe80::1'), ('fe80::1', None, False))
+
+    def test_stop_with_a_named_target_stays_idempotent(self):
+        self.c.runtime.mkdir(parents=True)
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(self.c.paths(app.LEGACY).ssh))
+        with patch.object(self.c, 'service_active', return_value=False), \
+                patch.dict(os.environ, {'REMOTE_DEV_HOST': 'srv'}):
+            self.c.stop('srv')
+            self.c.stop()
+        self.assertFalse(self.c.paths(app.LEGACY).ssh.exists())
+
+    def test_start_without_browser_reuses_a_browser_connection(self):
+        self.connection(browser=True)
+        with patch.object(self.c, 'connection_ready', return_value=True), \
+                patch.object(self.c, 'enable_browser', side_effect=AssertionError('browser changed')):
+            self.c.start(None, None, False)
+            self.c.start('host', None, False)
+        self.assertTrue(self.c.read_connection(self.key)['browser'])
+
+    def test_unreadable_targets_fail_clearly_and_bad_entries_are_ignored(self):
+        self.c.targets_file.parent.mkdir(parents=True)
+        self.c.targets_file.write_text('{"targets": [{"ssh_port": 22}, {"host": "ok", "ssh_port": 22}]}')
+        self.assertEqual([item['host'] for item in self.c.read_targets()], ['ok'])
+        self.c.targets_file.write_text('{broken')
+        with self.assertRaisesRegex(RuntimeError, 'targets'):
+            self.c.resolve_start(None, None, None)
+
+    def test_failure_to_remember_keeps_a_started_connection(self):
+        self.start_fixture()
+        master = self.child()
+        def control(values, action, *args):
+            return subprocess.CompletedProcess([], 0, 'Master running (pid=%d)' % master.pid, '')
+        with patch.object(self.c, 'systemctl', side_effect=self.ok), \
+                patch.object(self.c, 'service_active', return_value=False), \
+                patch.object(self.c, 'wait_health'), \
+                patch.object(self.c, 'master_command', return_value=['/bin/true']), \
+                patch.object(self.c, 'control', side_effect=control), \
+                patch.object(self.c, 'remember', side_effect=OSError('read-only')), \
+                patch.object(app, 'require_free_port'), \
+                patch.object(app.subprocess, 'run', side_effect=lambda args, **k: subprocess.CompletedProcess(args, 0)), \
+                patch.object(app.sys, 'stderr', io.StringIO()) as err:
+            self.c.start('user@host', 22, False)
+        self.assertIn('not remembered', err.getvalue())
+        self.assertEqual(self.c.read_connection(self.key)['phase'], 'ready')
+
+    def test_install_prepares_only_a_new_server_while_connections_run(self):
+        self.connection(host='me@nexcom23')
+        calls = []
+        def remote(*args):
+            with self.c.lock(nonblocking=True):  # running connections must not wait for the remote install
+                calls.append(args[1])
+        with patch.object(self.c, 'service_active', return_value=True), \
+                patch.object(app.provisioning, 'local_install', side_effect=AssertionError('local files changed')), \
+                patch.object(app.provisioning, 'remote_call', side_effect=remote):
+            self.c.install('ubuntu@aws-sg')
+        self.assertEqual(calls, ['ubuntu@aws-sg'])
+
+    def test_install_remembers_target_for_start_and_uninstall_forgets_it(self):
+        key = self.home / 'aws.pem'
+        key.touch()
+        calls = []
+        def install(app_, root, host, port, identity_file, *args):
+            calls.append(('install', host, port, identity_file))
+        def uninstall(app_, root, host, port, identity_file):
+            calls.append(('uninstall', host, port, identity_file))
+        with patch.object(app.provisioning, 'install', side_effect=install), \
+                patch.object(app.provisioning, 'uninstall', side_effect=uninstall), \
+                patch.object(self.c, 'stop'):
+            self.c.install('ubuntu@aws-sg', 2200, str(key))
+            target = self.c.resolve_start('aws', None, None)
+            self.assertEqual((target['host'], target['ssh_port'], target['identity_file']),
+                             ('ubuntu@aws-sg', 2200, str(key)))
+            self.c.install('aws', None, None, True)
+            self.c.install()
+            self.c.uninstall('aws')
+        self.assertEqual(calls, [('install', 'ubuntu@aws-sg', 2200, str(key)),
+                                 ('install', 'ubuntu@aws-sg', 2200, str(key)),
+                                 ('install', None, 22, None),
+                                 ('uninstall', 'ubuntu@aws-sg', 2200, str(key))])
+        self.assertEqual(self.c.read_targets(), [])
+
+    def test_failed_install_remembers_nothing(self):
+        with patch.object(app.provisioning, 'install', side_effect=subprocess.CalledProcessError(1, 'ssh')):
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.c.install('ubuntu@aws-sg')
+        self.assertEqual(self.c.read_targets(), [])
+
+    def test_install_and_uninstall_accept_the_short_host_option(self):
+        for command in ['install', 'uninstall']:
+            args = app.parser().parse_args([command, '-H', 'aws'])
+            self.assertEqual((args.host, args.ssh_port), ('aws', None))
+
+    def test_names_match_exactly_or_by_prefix(self):
+        items = [{'host': 'hamlin@172.25.2.23', 'ssh_port': 22, 'name': 'nexcom23'},
+                 {'host': 'ubuntu@13.229.1.2', 'ssh_port': 22, 'name': 'aws-sg'},
+                 {'host': 'nexus', 'ssh_port': 22}]
+        self.assertEqual(app.match_targets('aws', items), [items[1]])
+        self.assertEqual(app.match_targets('nexcom23', items), [items[0]])
+        self.assertEqual(len(app.match_targets('nex', items)), 2, 'name and hostname prefixes are both candidates')
+        self.assertEqual(app.match_targets('172.25', items), [items[0]], 'addresses still work')
+        self.assertEqual(app.match_targets('ubuntu@aws', items), [], 'a user restricts to hostnames')
+        self.assertEqual(app.match_targets('=aws-sg', items), [items[1]], 'exact name')
+        self.assertEqual(app.describe(items[0]), 'nexcom23 (hamlin@172.25.2.23:22)')
+        self.assertEqual(app.describe(items[2]), 'nexus:22')
+
+    def test_install_name_is_used_by_start_open_and_status(self):
+        calls = []
+        with patch.object(app.provisioning, 'install', side_effect=lambda *a: calls.append(a[2:5])):
+            self.c.install('hamlin@172.25.2.23', None, None, name='nexcom23')
+        self.assertEqual(self.c.read_targets()[0]['name'], 'nexcom23')
+        target = self.c.resolve_start('nex', None, None)
+        self.assertEqual((target['host'], target['name']), ('hamlin@172.25.2.23', 'nexcom23'))
+        self.connection(host='hamlin@172.25.2.23', name='nexcom23')
+        self.connection(id='other', host='ubuntu@13.229.1.2')
+        self.assertEqual(self.c.resolve_active('nexcom')['host'], 'hamlin@172.25.2.23')
+        with patch.object(self.c, 'service_active', return_value=True), \
+                patch.object(self.c, 'control', side_effect=self.ok):
+            names = [item['name'] for item in self.c.status()['connections']]
+        self.assertEqual(names, ['nexcom23', None])
+
+    def test_remember_keeps_existing_name_and_renames_on_request(self):
+        self.c.remember('hamlin@172.25.2.23', 22, None, name='nexcom23')
+        self.c.remember('hamlin@172.25.2.23', 22, '/k')
+        self.assertEqual(self.c.read_targets()[0]['name'], 'nexcom23')
+        self.c.remember('hamlin@172.25.2.23', 22, '/k', name='nex1')
+        self.assertEqual(self.c.read_targets()[0]['name'], 'nex1')
+
+    def test_invalid_or_duplicate_names_are_rejected(self):
+        self.c.remember('ubuntu@13.229.1.2', 22, None, name='aws')
+        for name in ['-bad', '=x', 'a b', 'user@x']:
+            with self.assertRaises(ValueError):
+                self.c.target('hamlin@172.25.2.23', None, None, name)
+        with self.assertRaisesRegex(ValueError, 'already names'):
+            self.c.target('hamlin@172.25.2.23', None, None, 'aws')
+        self.assertEqual(self.c.target('aws', None, None, 'aws')['name'], 'aws')
+
+    def test_start_on_a_running_connection_can_rename_it(self):
+        self.connection()
+        self.c.remember('user@host', 22, None)
+        with patch.object(self.c, 'connection_ready', return_value=True):
+            self.c.start('user@host', None, False, name='box')
+        self.assertEqual(self.c.read_connection(self.key)['name'], 'box')
+        self.assertEqual(self.c.read_targets()[0]['name'], 'box')
+        self.assertEqual(self.c.resolve_active('box')['host'], 'user@host')
+
+    def test_start_and_install_accept_a_name(self):
+        for command in ['start', 'install']:
+            self.assertEqual(app.parser().parse_args([command, '-H', 'h', '--name', 'n']).name, 'n')
 
     def bootstrap(self, browser=False, path=None):
         executable = self.home / '.local/bin/claude'

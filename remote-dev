@@ -177,8 +177,7 @@ KEYBOARD_RESET = '\033[<99u'  # pop every kitty keyboard flag entry of the curre
 
 
 def restore_terminal(clean):
-    """Idempotent reset after a Claude channel; leaving the alternate screen first moves the cursor, so skip it
-    when Claude exited cleanly and restored the screen itself."""
+    """Reset modes after a Claude channel; a clean exit already left the alternate screen."""
     if not sys.stdout.isatty():
         return
     with contextlib.suppress(OSError, ValueError):
@@ -201,7 +200,8 @@ def target_key(host, port):
 
 
 def describe(values):
-    return '%s:%d' % (values['host'], values['ssh_port'])
+    target = '%s:%d' % (values['host'], values['ssh_port'])
+    return '%s (%s)' % (values['name'], target) if values.get('name') else target
 
 
 def split_target(host):
@@ -209,19 +209,40 @@ def split_target(host):
     return user, name.strip('[]')
 
 
+def parse_query(query):
+    """Split a --host value into (target, port or None, literal). '=TARGET' skips matching."""
+    literal = query.startswith('=')
+    query = query[1:] if literal else query
+    match = re.fullmatch(r'((?:[^@]*@)?(?:\[[^\]]*\]|[^:\[\]]+)):(\d+)', query)
+    if match:
+        return match.group(1), int(match.group(2)), literal
+    return query, None, literal
+
+
+def prefix_matches(name, prefix):
+    """A prefix that does not end inside a number: server1 does not select server10."""
+    if not prefix or not name.startswith(prefix):
+        return False
+    following = name[len(prefix):len(prefix) + 1]
+    return not (following.isdigit() and prefix[-1].isdigit())
+
+
 def match_targets(query, candidates):
-    """Exact target first, otherwise a unique hostname-prefix match (user must match when given)."""
-    exact = [item for item in candidates if item['host'] == query]
-    if exact:
+    """An exact name or target first, otherwise name and hostname prefixes (a given user must match)."""
+    query, port, literal = parse_query(query)
+    candidates = [item for item in candidates if port is None or item['ssh_port'] == port]
+    exact = [item for item in candidates if query in (item['host'], item.get('name'))]
+    if exact or literal:
         return exact
     user, name = split_target(query)
     return [item for item in candidates
-            if split_target(item['host'])[1].startswith(name)
-            and (not user or split_target(item['host'])[0] == user)]
+            if (not user and prefix_matches(item.get('name') or '', name))
+            or (prefix_matches(split_target(item['host'])[1], name)
+                and (not user or split_target(item['host'])[0] == user))]
 
 
 def ambiguous(query, found):
-    return RuntimeError('%s matches several targets: %s; use a longer --host'
+    return RuntimeError('%s matches several targets: %s; use a longer --host, HOST:PORT, or =TARGET for an exact one'
                         % (query, ', '.join(describe(item) for item in found)))
 
 
@@ -301,15 +322,45 @@ class Controller:
             targets = json.loads(self.targets_file.read_text()).get('targets', [])
         except FileNotFoundError:
             return []
+        except (ValueError, AttributeError) as error:
+            raise RuntimeError('Remembered targets are unreadable; fix or remove ' + str(self.targets_file)) from error
+        targets = [item for item in targets if isinstance(item, dict) and isinstance(item.get('host'), str)
+                   and isinstance(item.get('ssh_port'), int)]
         return sorted(targets, key=lambda item: item.get('last_used', 0), reverse=True)
 
-    def remember(self, values):
+    def save_target(self, host, port, identity_file, keep=True, name=None):
+        """Update targets.json; the caller holds the control lock. A missing name keeps the old one."""
+        targets = self.read_targets()
+        previous = [item for item in targets if (item['host'], item['ssh_port']) == (host, port)]
+        targets = [item for item in targets if item not in previous]
+        if keep:
+            name = name or (previous[0].get('name') if previous else None)
+            targets.insert(0, {'host': host, 'ssh_port': port, 'identity_file': identity_file,
+                               'name': name, 'last_used': int(time.time())})
+        atomic_json(self.targets_file, {'targets': targets})
+
+    def remember(self, *args, **kwargs):
         with self.lock():
-            targets = [item for item in self.read_targets()
-                       if (item['host'], item['ssh_port']) != (values['host'], values['ssh_port'])]
-            targets.insert(0, {'host': values['host'], 'ssh_port': values['ssh_port'],
-                               'identity_file': values.get('identity_file'), 'last_used': int(time.time())})
-            atomic_json(self.targets_file, {'targets': targets})
+            self.save_target(*args, **kwargs)
+
+    def target(self, host, port, identity_file, name=None):
+        """Resolve, validate and announce a target for start/install/uninstall."""
+        with self.lock():
+            target = self.resolve_start(host, port, identity_file)
+            if name:
+                if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', name):
+                    raise ValueError('--name may contain letters, digits, ".", "_" and "-"')
+                owner = next((item for item in self.read_targets() if item.get('name') == name), None)
+                if owner and (owner['host'], owner['ssh_port']) != (target['host'], target['ssh_port']):
+                    raise ValueError('%s already names %s' % (name, describe(owner)))
+                target['name'] = name
+        validate_host(target['host'])
+        ssh_options(target['ssh_port'], target['identity_file'])
+        if target['identity_file']:
+            target['identity_file'] = str(Path(target['identity_file']).expanduser().resolve())
+        if target['note']:
+            print('Target %s (%s).' % (describe(target), target['note']), flush=True)
+        return target
 
     def resolve_start(self, host, port, identity_file):
         active = self.connections()
@@ -326,6 +377,10 @@ class Controller:
                     raise RuntimeError('No previous target is remembered; pass --host USER@HOST')
                 base, note = targets[0], 'last used'
         else:
+            target, query_port, _ = parse_query(host)
+            if port is not None and query_port is not None and port != query_port:
+                raise ValueError('--host %s and --ssh-port %d disagree' % (host, port))
+            port = query_port if port is None else port
             candidates = {}
             for item in active + self.read_targets():
                 candidates.setdefault((item['host'], item['ssh_port']), item)
@@ -335,12 +390,12 @@ class Controller:
                 raise ambiguous(host, found)
             if found:
                 base = found[0]
-                note = None if base['host'] == host else 'matched "%s"' % host
+                note = None if base['host'] == target else 'matched "%s"' % host
             else:
-                validate_host(host)
-                base = {'host': host, 'ssh_port': 22, 'identity_file': None}
+                validate_host(target)
+                base = {'host': target, 'ssh_port': 22, 'identity_file': None}
         return {'host': base['host'], 'ssh_port': base['ssh_port'] if port is None else port,
-                'identity_file': identity_file or base.get('identity_file'), 'note': note}
+                'identity_file': identity_file or base.get('identity_file'), 'name': base.get('name'), 'note': note}
 
     def resolve_active(self, host=None):
         active = self.connections()
@@ -373,12 +428,21 @@ class Controller:
     def service_active(self):
         return self.systemctl('is-active', check=False).returncode == 0
 
-    def install(self, host=None, port=22, identity_file=None, browser=False, install_node=False):
-        return provisioning.install(self, ROOT, host, port, identity_file, browser, install_node)
+    def install(self, host=None, port=None, identity_file=None, browser=False, install_node=False, name=None):
+        if host is None:
+            return provisioning.install(self, ROOT, None, 22, None, browser, install_node)
+        target = self.target(host, port, identity_file, name)
+        provisioning.install(self, ROOT, target['host'], target['ssh_port'], target['identity_file'],
+                             browser, install_node)
+        self.remember(target['host'], target['ssh_port'], target['identity_file'], name=target['name'])
 
-    def uninstall(self, host=None, port=22, identity_file=None):
+    def uninstall(self, host=None, port=None, identity_file=None):
+        target = self.target(host, port, identity_file) if host else None
         self.stop(everything=True)
-        return provisioning.uninstall(self, ROOT, host, port, identity_file)
+        if target is None:
+            return provisioning.uninstall(self, ROOT, None, 22, None)
+        provisioning.uninstall(self, ROOT, target['host'], target['ssh_port'], target['identity_file'])
+        self.remember(target['host'], target['ssh_port'], None, keep=False)
 
     def master_command(self, values):
         paths = self.paths(values['key'])
@@ -475,10 +539,10 @@ class Controller:
     def forward_oauth(self, values):
         """Best effort: the first connection gets the local OAuth callback; others use remote-dev auth."""
         shared = self.read_shared()
-        holder = shared.get('oauth_holder')
-        if holder and holder != values['key'] and self.read_connection(holder):
+        holder = self.read_connection(shared['oauth_holder']) if shared.get('oauth_holder') else None
+        if holder:
             print('OAuth callback 8765 stays with %s; run remote-dev auth --host %s before a local-dev login.'
-                  % (describe(self.read_connection(holder)), values['host']), flush=True)
+                  % (describe(holder), values['host']), flush=True)
             return
         try:
             result = self.control(values, 'forward', *OAUTH_FORWARD)
@@ -518,15 +582,9 @@ class Controller:
         print('OAuth callback 8765 now forwards to %s. Log in to local-dev from a Claude session there.'
               % describe(values))
 
-    def start(self, host=None, port=None, browser=False, identity_file=None):
-        with self.lock():
-            target = self.resolve_start(host, port, identity_file)
-        host, port, identity_file = target['host'], target['ssh_port'], target['identity_file']
-        validate_host(host)
-        ssh_options(port, identity_file)
-        identity_file = str(Path(identity_file).expanduser().resolve()) if identity_file else None
-        if target['note']:
-            print('Target %s:%d (%s).' % (host, port, target['note']), flush=True)
+    def start(self, host=None, port=None, browser=False, identity_file=None, name=None):
+        target = self.target(host, port, identity_file, name)
+        host, port, identity_file, name = target['host'], target['ssh_port'], target['identity_file'], target['name']
         key = target_key(host, port)
         paths = self.paths(key)
         with self.lock(paths.lock, nonblocking=True):
@@ -536,8 +594,11 @@ class Controller:
                     existing = self.read_connection(key)
                     if existing:
                         current = (existing['host'], existing['ssh_port'], existing.get('identity_file'))
-                        if (current == (host, port, identity_file) and (browser or not existing['browser'])
-                                and self.connection_ready(existing)):
+                        if current == (host, port, identity_file) and self.connection_ready(existing):
+                            if name != existing.get('name'):
+                                existing['name'] = name
+                                self.write_connection(existing)
+                                self.save_target(host, port, identity_file, name=name)
                             if browser:
                                 self.enable_browser(existing)
                             print('Shared connection and browser are ready.' if browser
@@ -567,7 +628,7 @@ class Controller:
                         require_free_port(7676)
                     values = {'id': str(uuid.uuid4()), 'key': key, 'phase': 'starting', 'host': host,
                               'ssh_port': port, 'scope': scope, 'browser': browser,
-                              'identity_file': identity_file, 'clipboard_token': secrets.token_hex(16),
+                              'identity_file': identity_file, 'name': name, 'clipboard_token': secrets.token_hex(16),
                               'controller': process_record(os.getpid()), 'watcher_owned': False}
                     self.write_connection(values)
                     if not service:
@@ -613,8 +674,11 @@ class Controller:
                             sys.executable, str(Path(__file__).resolve()), '_watch', key, values['id']], check=True)
                         values['watcher_owned'] = True
                         self.write_connection(values)
-                self.remember(values)
                 started = True
+                try:
+                    self.remember(host, port, identity_file, name=name)
+                except (OSError, RuntimeError) as error:
+                    print('Warning: target not remembered: ' + str(error), file=sys.stderr, flush=True)
                 print('Shared connection to %s ready. Run remote-dev open in any project terminal.' % describe(values))
             finally:
                 reap(child)
@@ -767,7 +831,7 @@ class Controller:
             active = self.connections()
             if everything:
                 selected = active
-            elif active or host or os.environ.get('REMOTE_DEV_HOST'):
+            elif active:
                 selected = [self.resolve_active(host)]
             else:
                 selected = []
@@ -820,7 +884,8 @@ class Controller:
             owned = [{'id': record['id'], 'client': record['client'], 'paths': record['paths'],
                       'running': same_process(record.get('ssh'))}
                      for _, record in sessions if record.get('connection', LEGACY) == values['key']]
-            items.append({'host': values['host'], 'ssh_port': values['ssh_port'], 'key': values['key'],
+            items.append({'name': values.get('name'), 'host': values['host'], 'ssh_port': values['ssh_port'],
+                          'key': values['key'],
                           'running': values.get('phase') == 'ready' and service and ssh,
                           'ssh_running': ssh, 'browser_requested': bool(values.get('browser')),
                           'oauth_callback': values['key'] in (LEGACY, shared.get('oauth_holder')),
@@ -838,18 +903,23 @@ def parser():
     prepared = commands.add_parser('install', help='Install local dependencies and configure an optional remote server')
     removed = commands.add_parser('uninstall', help='Remove owned installation resources, preserving user data')
     start = commands.add_parser('start', help='Start shared access to a remote server without launching Claude')
-    start.add_argument('-H', '--host', help='SSH target [USER@]HOST, or a hostname prefix of a remembered target; '
+    start.add_argument('-H', '--host', help='SSH target [USER@]HOST[:PORT], a hostname prefix of a remembered '
+                                            'target, or =TARGET to skip matching; '
                                             'default: the running connection or the last target')
     start.add_argument('--ssh-port', type=int, help='Default: remembered port or 22')
     start.add_argument('--browser', action='store_true', help='Start or borrow dedicated local Chrome')
+    for command in [prepared, start]:
+        command.add_argument('--name', help='Short name to select this server with -H; renames a remembered one')
     for command in [prepared, removed]:
-        command.add_argument('--host', help='Optional remote SSH target: [USER@]HOST')
-        command.add_argument('--ssh-port', type=int, default=22)
+        command.add_argument('-H', '--host', help='Optional remote server, resolved like start --host; '
+                                                  'install remembers it, uninstall forgets it')
+        command.add_argument('--ssh-port', type=int, help='Default: remembered port or 22')
     for command in [prepared, start, removed]:
         command.add_argument('-i', '--identity-file', help='Local SSH private key; never copied remotely')
     prepared.add_argument('--browser', action='store_true', help='Prepare local Chrome and remote browser MCP')
     prepared.add_argument('--with-node', dest='install_node', action='store_true', help='Install private Node24 if no compatible runtime exists')
-    selector = 'Running connection: exact target or hostname prefix; default: REMOTE_DEV_HOST or the only connection'
+    selector = ('Running connection: [USER@]HOST[:PORT], a hostname prefix, or =TARGET for exact; '
+                'default: REMOTE_DEV_HOST or the only connection')
     opened = commands.add_parser('open', help='Open an independent Claude session; default directory is cwd')
     opened.add_argument('paths', nargs='*', help='Local repository directories')
     opened.add_argument('-H', '--host', help=selector)
@@ -869,7 +939,7 @@ def print_status(status):
     print('Connection: ' + ('running' if status['running'] else 'stopped or partial'))
     print('DevSpace: ' + ('running' if status['service_running'] else 'stopped'))
     for connection in status['connections']:
-        print('%s:%d %s%s%s' % (connection['host'], connection['ssh_port'],
+        print('%s %s%s%s' % (describe(connection),
             'running' if connection['running'] else 'partial',
             ', browser' if connection['browser_requested'] else '',
             ', OAuth callback' if connection['oauth_callback'] else ''))
@@ -893,9 +963,9 @@ def main(argv=None):
             return 0
         args = parser().parse_args(argv)
         if args.command == 'install':
-            controller.install(args.host, args.ssh_port, args.identity_file, args.browser, args.install_node)
+            controller.install(args.host, args.ssh_port, args.identity_file, args.browser, args.install_node, args.name)
         elif args.command == 'start':
-            controller.start(args.host, args.ssh_port, args.browser, args.identity_file)
+            controller.start(args.host, args.ssh_port, args.browser, args.identity_file, args.name)
         elif args.command == 'uninstall':
             controller.uninstall(args.host, args.ssh_port, args.identity_file)
         elif args.command == 'open':

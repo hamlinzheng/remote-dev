@@ -31,7 +31,7 @@ DevSpace handles local files and commands. Chrome DevTools MCP runs remotely and
 | --- | --- | --- |
 | DevSpace MCP | Remote loopback → local DevSpace | `7676` |
 | Browser CDP, with `--browser` | Remote loopback → local Chrome | `9222` |
-| OAuth callback | Local browser → remote client callback | `8765` |
+| OAuth callback, one connection at a time | Local browser → remote client callback | `8765` |
 | Clipboard images | Remote loopback → local clipboard socket | `7677` |
 
 Image paste: `Ctrl+V` in remote Claude runs a remote `xclip` shim that reads images (never text) from the local X11 clipboard through `7677`, authenticated by a per-connection token. Copying text out needs no forward: remote Claude always uses OSC 52 over SSH, which the local terminal writes to the clipboard. In Claude's fullscreen renderer (`/tui fullscreen`) selecting text copies it; hold Shift for the terminal's native selection.
@@ -59,12 +59,12 @@ Clone or download the repository, keep its directory, and run:
 ./remote-dev install --host USER@HOST -i /path/to/private-key --browser
 ```
 
-The command prepares local dependencies, creates the PATH symlink and DevSpace service, and configures the specified remote server. It does not start services or enable automatic startup. Ensure `~/.local/bin` is on PATH. Add `--with-node` if needed. Without `--host`, install prepares only the local side; without `--browser`, it skips browser support.
+The command prepares local dependencies, creates the PATH symlink and DevSpace service, and configures the specified remote server. It does not start services or enable automatic startup. Ensure `~/.local/bin` is on PATH. Add `--with-node` if needed. Without `--host`, install prepares only the local side; without `--browser`, it skips browser support. A successful install remembers the target, port and key path, so later commands need none of them.
 
 Then use local terminals:
 
 ```bash
-remote-dev start --host USER@HOST -i /path/to/private-key --browser
+remote-dev start --browser
 remote-dev open
 remote-dev open /path/to/api /another/path/to/ui
 remote-dev status
@@ -76,24 +76,39 @@ remote-dev stop
 
 | Command / option | Purpose |
 | --- | --- |
-| `install` | Prepare dependencies, services and MCP configuration |
-| `start [-H TARGET]` | Start shared access to a server; `--browser` enables local Chrome |
+| `install [-H TARGET] [--name NAME]` | Prepare dependencies, services and MCP configuration; remembers the target |
+| `start [-H TARGET] [--name NAME]` | Start shared access to a server; `--browser` enables local Chrome |
 | `open [-H TARGET] [PATH ...]` | Open a Claude session |
 | `status [-H TARGET] [--json]` | Inspect access, browser and sessions of all or one connection |
 | `stop [-H TARGET \| --all]` | Close a connection with its sessions, or all of them |
 | `auth [-H TARGET]` | Move the local OAuth callback port `8765` to a connection |
-| `uninstall [--host USER@HOST]` | Remove owned local and optional remote installation resources |
+| `uninstall [-H TARGET]` | Remove owned local and optional remote installation resources; forgets the target |
 | `-i`, `--identity-file` | Local SSH private key, for install/start/uninstall |
 | `--ssh-port PORT` | SSH port for install/start/uninstall; default `22` or the remembered port |
 | `--with-node` | Permit private Node installation when needed |
 
-`-i` is optional when SSH already has a usable identity or agent. Repeating `start` for a running target reuses access. Adding `--browser` enables Chrome and its SSH forward without interrupting existing sessions. Repeat it to reopen Chrome after closing it. Other option changes for a running target require stopping it. Neither `start` nor `open` installs or updates dependencies.
+`-i` is optional when SSH already has a usable identity or agent. Repeating `start` for a running target reuses access. Adding `--browser` enables Chrome and its SSH forward without interrupting existing sessions. Repeat it to reopen Chrome after closing it. `--name` renames it in place. Other option changes for a running target require stopping it. Neither `start` nor `open` installs or updates dependencies.
 
 ### Multiple servers and target selection
 
-Run `start` once per server; connections are independent and share the local DevSpace and Chrome. Every successful `start` remembers its target, port and identity-file path (never key contents) in `~/.config/remote-dev/targets.json`.
+Prepare each server once, then run `start` once per server. Connections are independent and share the local DevSpace and Chrome. While access is running, `install --host` prepares only the new server and leaves the local installation untouched.
 
-`TARGET` is an exact `[USER@]HOST` or a prefix of the hostname part, e.g. `nex` for `user@nexcom23`; `user@nex` also restricts the user. A prefix must match exactly one candidate, otherwise the command lists the candidates.
+```bash
+remote-dev install -H ubuntu@13.229.1.2 -i ~/.ssh/aws.pem --name aws-sg --browser   # the only full entry
+remote-dev start -H aws --browser
+remote-dev install -H me@172.25.2.23 --ssh-port 2222 --name nexcom23
+remote-dev start -H nex
+remote-dev open -H aws                 # several connections: choose one
+export REMOTE_DEV_HOST=nex             # or fix this terminal to one server
+remote-dev open
+remote-dev auth -H nex                 # before the first local-dev login on that server
+remote-dev stop -H aws                 # nexcom23 keeps running; stop --all closes both
+remote-dev start -H aws                # later: the remembered port and key are reused
+```
+
+Every successful `install --host` and `start` remembers its target, port, identity-file path (never key contents) and optional `--name` in `~/.config/remote-dev/targets.json`; `uninstall --host` forgets it. `install`, `uninstall` and `start` resolve `-H` the same way.
+
+`TARGET` is an exact name or `[USER@]HOST`, or a prefix of a name or of the hostname part, e.g. `nex` for the name `nexcom23` or for `user@nexcom23`; `user@nex` matches hostnames of that user only. Names are optional short labels, useful for IP addresses; `--name` on `install` or `start` sets or renames one. A prefix ending in a digit does not match further digits, so `server1` never selects `server10` and `10.0.0.1` never selects `10.0.0.12`. Append `:PORT` to choose between connections to one host. Prefix `=` to disable matching, e.g. `start -H =prod` for an SSH alias `prod` while `deploy@prod-db` is remembered. A prefix must match exactly one candidate, otherwise the command lists the candidates.
 
 | Command | Without `-H` | With `-H TARGET` |
 | --- | --- | --- |
@@ -149,12 +164,26 @@ Keep SSH-server `GatewayPorts no` so reverse forwards stay on loopback. CDP has 
 
 ## Maintenance
 
-Installation is repeatable while access is stopped. It preserves authentication/configuration and refuses unrelated command entries, services and MCP registrations. Both npm runtimes use repository lockfiles and staged `npm ci` installation. If remote preparation fails, completed local install remains usable; fix the error and rerun install.
+Installation is repeatable while access is stopped; while it runs, only `install --host` for another server is allowed. It preserves authentication/configuration and refuses unrelated command entries, services and MCP registrations. Both npm runtimes use repository lockfiles and staged `npm ci` installation. If remote preparation fails, completed local install remains usable; fix the error and rerun install.
 
-To update, stop access, update this checkout and rerun install. A connection started by a version before multi-server support can still be used with `open`, `status` and `stop`, but new connections are refused until it is stopped. Tracked runtime trees are removed by uninstall when no preserved MCP registration needs them; untracked legacy directories are left alone. Back up application data before downgrading because database migrations may limit compatibility.
+To update, stop access, update this checkout and rerun install. A connection started by a version before multi-server support can still be used with `open`, `status` and `stop`, but new connections are refused until it is stopped. Such versions remembered no targets, so give the full target once:
 
 ```bash
-remote-dev uninstall --host USER@HOST -i /path/to/private-key
+remote-dev stop
+git pull
+remote-dev install \
+  -H USER@HOST \
+  -i /path/to/private-key \
+  --name NAME \
+  --browser
+remote-dev start \
+  -H NAME \
+  --browser
+```
+ Tracked runtime trees are removed by uninstall when no preserved MCP registration needs them; untracked legacy directories are left alone. Back up application data before downgrading because database migrations may limit compatibility.
+
+```bash
+remote-dev uninstall -H TARGET
 ```
 
 Without `--host`, uninstall is local-only. It removes recorded unchanged owned resources, preserving modified MCP registrations and runtimes they may use. Credentials, configuration, browser profile, Claude history, workspaces and project workloads remain. A local ownership record allows reinstalling with `./remote-dev install`.
@@ -174,8 +203,9 @@ tests/                     isolated regression tests
 | --- | --- |
 | `~/.local/bin/remote-dev` | Symlink to this checkout |
 | `~/.config/remote-dev/devspace/` | Local configuration and owner authentication |
+| `~/.config/remote-dev/targets.json` | Remembered targets: host, port, identity-file path, name |
 | `~/.local/share/remote-dev/` | Managed runtimes and installation records; local DevSpace state |
-| `$XDG_RUNTIME_DIR/remote-dev/` | Local connection/session records, SSH and clipboard sockets |
+| `$XDG_RUNTIME_DIR/remote-dev/` | `connections/<key>/` records with SSH and clipboard sockets, shared ownership, session records |
 | `~/.local/state/remote-dev/browser/` | Browser record and logs |
 | `~/.local/share/chrome-agent-dev/` | Local persistent Chrome profile |
 
@@ -191,11 +221,11 @@ Codex needs client-specific install and launch handling, MCP registration in its
 
 ```bash
 remote-dev status --json
-journalctl --user -u remote-dev.service -u remote-dev-link.service -n 30 --no-pager
+journalctl --user -u remote-dev.service -u 'remote-dev-link*' -n 30 --no-pager
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
 
-Status exits `0` when shared access is running, `1` when stopped/partial and `2` on errors. Browser/session states are reported separately; health checks do not establish OAuth authorization.
+Status lists each connection and exits `0` when at least one (or the one chosen with `-H`) is running, `1` when stopped/partial and `2` on errors. Browser/session states are reported separately; health checks do not establish OAuth authorization.
 
 Run stop to clear a confirmed abandoned Unix control socket. Active untracked sockets and unexpected files are preserved and reported.
 

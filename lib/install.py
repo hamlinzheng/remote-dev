@@ -360,14 +360,20 @@ def install(app, root, host=None, port=22, identity_file=None, browser=False, in
     if host:
         validate_host(host)
     with app.lock('startup.lock', nonblocking=True), app.lock():
-        if app.connections() or app.service_active():
+        running = bool(app.connections() or app.service_active())
+        if running and not host:
             raise RuntimeError('Stop shared access before install')
-        local_install(app, root, browser, install_node)
-        print('Local install complete. DevSpace is stopped; no automatic startup was enabled.', flush=True)
-        if not shutil.which('xclip'):
-            print('Note: xclip not found; image paste is disabled until it is installed (sudo apt install xclip).', flush=True)
-        if host:
-            remote_call(root, host, port, identity_file, browser, install_node)
+        if not running:
+            local_install(app, root, browser, install_node)
+            print('Local install complete. DevSpace is stopped; no automatic startup was enabled.', flush=True)
+            if not shutil.which('xclip'):
+                print('Note: xclip not found; image paste is disabled until it is installed (sudo apt install xclip).', flush=True)
+            if host:
+                remote_call(root, host, port, identity_file, browser, install_node)
+    if running:
+        # Local files are in use; prepare only the new server, outside the locks so connections keep working.
+        print('Shared access is running; skipping the local install.', flush=True)
+        remote_call(root, host, port, identity_file, browser, install_node)
     print('Installation complete. Run remote-dev start with an explicit SSH target.')
 
 
