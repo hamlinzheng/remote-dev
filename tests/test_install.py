@@ -123,6 +123,19 @@ class InstallationTests(unittest.TestCase):
             install.remove_owned_paths(data, [str(outside)])
         self.assertTrue((outside / 'keep').exists())
 
+    def test_remote_failure_prints_one_line_not_a_traceback(self):
+        """Run the remote installer locally where Claude is missing; expect a short error on both sides."""
+        captured, real_run = {}, subprocess.run
+        def run(args, **kwargs):
+            result = real_run(['sh', '-c', args[-1]], input=kwargs['input'], capture_output=True,
+                                    env={'HOME': str(self.home), 'PATH': '/usr/bin:/bin'})
+            captured['stderr'] = result.stderr.decode()
+            return result
+        with patch.object(install.subprocess, 'run', side_effect=run):
+            with self.assertRaisesRegex(RuntimeError, r'^Remote install on user@host failed; see the message above$'):
+                install.remote_call(install.ROOT, 'user@host', 22, None)
+        self.assertEqual(captured['stderr'], 'Error: Install and authenticate Claude Code on the remote server first\n')
+
     def local_fixture(self):
         from test_remote_dev import app
         c = app.Controller(self.home, self.home / 'run')

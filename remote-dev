@@ -489,8 +489,11 @@ class Controller:
         """Check the remote side and install the clipboard shim and token over stdin."""
         token = values.get('clipboard_token')
         request = json.dumps({'token': token, 'xclip': clipboard.SHIM}) if token else ''
-        subprocess.run(self.channel_command(values, remote_command('prepare', browser=browser), tty=False),
-                       input=request, text=True, check=True)
+        result = subprocess.run(self.channel_command(values, remote_command('prepare', browser=browser), tty=False),
+                                input=request, text=True)
+        if result.returncode:  # the remote side has printed the reason
+            raise RuntimeError('Remote preparation of %s failed; if it lacks remote-dev, run: remote-dev install -H %s%s'
+                               % (describe(values), values.get('name') or values['host'], ' --browser' if browser else ''))
 
     def acquire_browser(self, shared):
         """Start or borrow Chrome; ownership survives only while the same session file is current."""

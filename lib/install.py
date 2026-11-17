@@ -230,11 +230,16 @@ with tempfile.TemporaryDirectory(prefix='remote-dev-install-') as directory:
         archive.extractall(stage)
     sys.path.insert(0,str(stage))
     module=runpy.run_path(str(stage/'lib/install.py'))
-    module['remote_install'](json.loads(sys.argv[1]))
+    try:
+        module['remote_install'](json.loads(sys.argv[1]))
+    except (OSError,ValueError,RuntimeError,module['subprocess'].SubprocessError) as error:
+        raise SystemExit('Error: %s' % error)
 '''
     command = shlex.join(['python3', '-c', runner, json.dumps(payload)])
-    subprocess.run(['ssh', *ssh_options(port, identity_file), '-T', host, command],
-                   input=bundle.getvalue(), check=True)
+    result = subprocess.run(['ssh', *ssh_options(port, identity_file), '-T', host, command],
+                            input=bundle.getvalue())
+    if result.returncode:
+        raise RuntimeError('Remote %s on %s failed; see the message above' % ('uninstall' if remove else 'install', host))
 
 
 def claude_command(home):

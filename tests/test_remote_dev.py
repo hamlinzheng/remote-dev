@@ -115,7 +115,7 @@ class CliTests(unittest.TestCase):
 
     def test_prepare_sends_clipboard_token_on_stdin_not_command_line(self):
         value = self.connection(clipboard_token='secret-token')
-        with patch.object(app.subprocess, 'run') as run:
+        with patch.object(app.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
             self.c.prepare(value, False)
         args, kwargs = run.call_args
         self.assertNotIn('secret-token', ' '.join(args[0]))
@@ -488,11 +488,15 @@ class CliTests(unittest.TestCase):
     def test_browser_prepare_failure_does_not_create_local_resources(self):
         child, browser_alive, forwarding = self.browser_environment()
         before = self.c.read_connection(self.key)
+        self.c.write_connection(dict(before, name='box'))
+        before = self.c.read_connection(self.key)
         with patch.object(app.subprocess, 'run', side_effect=[
                 subprocess.CompletedProcess([], 0, '', ''),
-                subprocess.CalledProcessError(1, ['ssh'])]):
-            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.CompletedProcess([], 1, '', '')]):
+            with self.assertRaises(RuntimeError) as raised:
                 self.c.start('user@host', 22, True)
+        self.assertEqual(str(raised.exception), 'Remote preparation of box (user@host:22) failed; '
+                         'if it lacks remote-dev, run: remote-dev install -H box --browser')
         self.assertEqual(self.c.read_connection(self.key), before)
         self.assertFalse(browser_alive.exists())
         self.assertFalse(forwarding.exists())
