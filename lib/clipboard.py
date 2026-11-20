@@ -10,11 +10,14 @@ import threading
 PORT = 7677
 IMAGE = re.compile(rb'image/(png|jpeg|jpg|gif|webp|bmp)')
 
-# Installed remotely as xclip; answers only Claude's image paste calls.
+# Installed remotely as xclip; answers only Claude's image paste calls, with -o before or after -t TYPE.
 SHIM = r'''#!/usr/bin/env python3
 import pathlib, socket, sys
 args = sys.argv[1:]
-if len(args) != 5 or args[:3] != ['-selection', 'clipboard', '-t'] or args[4] != '-o':
+if args.count('-o') != 1:
+    sys.exit(1)
+args.remove('-o')
+if len(args) != 4 or args[:3] != ['-selection', 'clipboard', '-t']:
     sys.exit(1)
 try:
     token = (pathlib.Path.home() / '.local/share/remote-dev/clipboard.token').read_text().strip()

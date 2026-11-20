@@ -44,6 +44,12 @@ class ClipboardTests(unittest.TestCase):
                 self.assertEqual(run('-selection', 'clipboard', '-t', 'TARGETS', '-o').stdout, b'image/png\n')
                 result = run('-selection', 'clipboard', '-t', 'image/png', '-o')
                 self.assertEqual((result.returncode, result.stdout), (0, PNG))
+                # Claude Code 2.1.328+ puts -o before -t.
+                self.assertEqual(run('-selection', 'clipboard', '-o', '-t', 'TARGETS').stdout, b'image/png\n')
+                result = run('-selection', 'clipboard', '-o', '-t', 'image/png')
+                self.assertEqual((result.returncode, result.stdout), (0, PNG))
+                self.assertEqual(run('-selection', 'clipboard', '-o', '-t', 'image/png', '-o').returncode, 1)
+                self.assertEqual(run('-selection', 'clipboard', '-o').returncode, 1)
                 self.assertEqual(run('-selection', 'clipboard', '-t', 'image/bmp', '-o').returncode, 1)
                 self.assertEqual(run('-selection', 'clipboard').returncode, 1)
 
