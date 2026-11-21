@@ -14,6 +14,7 @@ from lib.common import atomic_json, private_dir
 INTERVAL = 300
 TRANSCRIPTS = ['--include=*/', '--include=*.jsonl', '--exclude=*', '--append-verify']
 OTHERS = ['--exclude=*.jsonl']
+SESSION_ID = re.compile(r'[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}')
 
 # Remote: create and print the Claude project directory of workspace argv[1].
 PROJECT_DIR = r'''import os, pathlib, re, sys
@@ -43,20 +44,57 @@ def files(root):
     return {path.relative_to(root).as_posix(): path for path in sorted(root.rglob('*')) if path.is_file()}
 
 
+def new_lines(path, offset):
+    with path.open('rb') as stream:
+        stream.seek(offset)
+        return stream.read().count(b'\n')
+
+
+def title(path):
+    """Session name: /rename's name, else Claude's last generated title."""
+    with contextlib.suppress(OSError, ValueError, TypeError, KeyError):  # /rename's sidecar
+        name = json.loads((path.with_suffix('') / 'custom-title.json').read_text())['customTitle']
+        if isinstance(name, str) and name:
+            return name
+    names = {}
+    with contextlib.suppress(FileNotFoundError), path.open('rb') as stream:
+        for line in stream:
+            if b'Title"' in line:
+                with contextlib.suppress(ValueError):
+                    entry = json.loads(line)
+                    names.update((key, entry[key]) for key in ('customTitle', 'aiTitle')
+                                 if isinstance(entry.get(key), str))
+    return names.get('customTitle') or names.get('aiTitle') or ''
+
+
+def summarize(changes, root):
+    """One line per changed session (short id, name) or top directory, with new lines."""
+    groups = {}
+    for name, lines in changes.items():
+        top = name.split('/')[0]
+        top = top[:-len('.jsonl')] if top.endswith('.jsonl') else top
+        groups[top] = groups.get(top, 0) + lines
+    result = []
+    for top, lines in groups.items():
+        label = top[:8] + '  ' + title(root / (top + '.jsonl')) if SESSION_ID.fullmatch(top) else top
+        result.append(label.rstrip() + ('  +%d line%s' % (lines, 's' * (lines > 1)) if lines else ''))
+    return result
+
+
 def merge_transcript(source, target):
-    """Extend target to source's complete lines; False if they diverged."""
+    """Extend target to source's complete lines; return lines added, None if they diverged."""
     data = source.read_bytes()
     data = data[:data.rfind(b'\n') + 1]
     if not target.exists():
         private_dir(target.parent)
         target.write_bytes(data)
-        return True
+        return data.count(b'\n')
     current = target.read_bytes()
     if data.startswith(current):
         with target.open('ab') as stream:
             stream.write(data[len(current):])
-        return True
-    return current.startswith(data)
+        return data[len(current):].count(b'\n')
+    return 0 if current.startswith(data) else None
 
 
 class Store:
@@ -104,14 +142,17 @@ class Store:
             return {}
 
     def merge(self, key):
-        """Merge a mirror into main; return diverged transcripts, copied to conflicts/."""
-        state, diverged = self.read_state(key), []
+        """Merge a mirror into main; return ({changed file: new lines}, diverged copied to conflicts/)."""
+        state, changed, diverged = self.read_state(key), {}, []
         for name, source in files(self.mirror(key)).items():
             target = self.main / name
             if state.get(name) == signature(source) and target.exists():
                 continue
             if source.suffix == '.jsonl':
-                if not merge_transcript(source, target):
+                added = merge_transcript(source, target)
+                if added:
+                    changed[name] = added
+                elif added is None:
                     conflict = self.conflicts(key) / name
                     private_dir(conflict.parent)
                     shutil.copy2(source, conflict)
@@ -119,25 +160,28 @@ class Store:
             elif not target.exists() or source.stat().st_mtime_ns > target.stat().st_mtime_ns:
                 private_dir(target.parent)
                 shutil.copy2(source, target)
+                changed[name] = 0
             state[name] = signature(source)
         atomic_json(self.state_file(key), state)
-        return diverged
+        return changed, diverged
 
     def conflicted(self, key):
         directory = self.conflicts(key)
         return sorted(files(directory)) if directory.is_dir() else []
 
     def behind(self, key):
-        """(transcripts, others): which push passes the server needs."""
-        mirror, skip, transcripts, others = self.mirror(key), set(self.conflicted(key)), False, False
+        """What the server lacks: ({transcript: new lines}, {newer other file: 0})."""
+        mirror, skip, transcripts, others = self.mirror(key), set(self.conflicted(key)), {}, {}
         for name, source in files(self.main).items():
             target = mirror / name
             if name in skip:
                 continue
             if source.suffix == '.jsonl':
-                transcripts = transcripts or not target.exists() or source.stat().st_size > target.stat().st_size
-            else:
-                others = others or not target.exists() or source.stat().st_mtime_ns > target.stat().st_mtime_ns
+                offset = target.stat().st_size if target.exists() else 0
+                if source.stat().st_size > offset:
+                    transcripts[name] = new_lines(source, offset)
+            elif not target.exists() or source.stat().st_mtime_ns > target.stat().st_mtime_ns:
+                others[name] = 0
         return transcripts, others
 
     def refresh(self, key, skip):
@@ -199,7 +243,7 @@ class Remote:
         return store.merge(key)
 
     def push(self, store, key):
-        """Send what the server lacks; never shortens or touches diverged transcripts."""
+        """Send and return what the server lacks; never shortens or touches diverged transcripts."""
         transcripts, others = store.behind(key)
         skip = store.conflicted(key)
         excluded = ['--exclude=/' + name for name in skip]
@@ -209,3 +253,4 @@ class Remote:
             self.rsync(str(store.main) + '/', self.location(), excluded + OTHERS + ['--update'])
         if transcripts or others:
             store.refresh(key, set(skip))
+        return {**transcripts, **others}

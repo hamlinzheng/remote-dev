@@ -80,7 +80,7 @@ remote-dev stop
 | `install [-H TARGET] [--name NAME]` | Prepare dependencies, services and MCP configuration; remembers the target |
 | `start [-H TARGET] [--name NAME]` | Start shared access to a server; `--browser` enables local Chrome |
 | `open [-H TARGET] [PATH ...]` | Open a Claude session |
-| `sync [-H TARGET] [PATH ...]` | Sync a workspace's Claude transcripts with running connections; `open` does this automatically |
+| `sync [-H TARGET] [PATH ...]` | Sync a workspace's Claude transcripts with running connections and list what moved per session; `open` does this automatically |
 | `status [-H TARGET] [--json]` | Inspect access, browser and sessions of all or one connection |
 | `stop [-H TARGET \| --all]` | Close a connection with its sessions, or all of them |
 | `auth [-H TARGET]` | Move the local OAuth callback port `8765` to a connection; `open` does this automatically |

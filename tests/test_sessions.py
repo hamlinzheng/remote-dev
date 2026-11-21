@@ -33,34 +33,47 @@ class MergeTests(unittest.TestCase):
     def test_transcript_appends_only_complete_new_lines(self):
         self.put(self.store.main, 's.jsonl', b'1\n')
         self.put(self.mirror, 's.jsonl', b'1\n2\n3-partial')
-        self.assertEqual(self.store.merge('k'), [])
+        self.assertEqual(self.store.merge('k'), ({'s.jsonl': 1}, []))
         self.assertEqual((self.store.main / 's.jsonl').read_bytes(), b'1\n2\n')
 
     def test_main_ahead_of_server_is_kept(self):
         self.put(self.store.main, 's.jsonl', b'1\n2\n')
         self.put(self.mirror, 'sub/s.jsonl', b'x\n')
         self.put(self.mirror, 's.jsonl', b'1\n')
-        self.assertEqual(self.store.merge('k'), [])
+        self.assertEqual(self.store.merge('k'), ({'sub/s.jsonl': 1}, []))
         self.assertEqual((self.store.main / 's.jsonl').read_bytes(), b'1\n2\n')
         self.assertEqual((self.store.main / 'sub/s.jsonl').read_bytes(), b'x\n')
 
     def test_diverged_transcript_is_kept_aside_once(self):
         self.put(self.store.main, 's.jsonl', b'1\nmain\n')
         self.put(self.mirror, 's.jsonl', b'1\nserver\n')
-        self.assertEqual(self.store.merge('k'), ['s.jsonl'])
+        self.assertEqual(self.store.merge('k'), ({}, ['s.jsonl']))
         self.assertEqual((self.store.main / 's.jsonl').read_bytes(), b'1\nmain\n')
         self.assertEqual((self.store.conflicts('k') / 's.jsonl').read_bytes(), b'1\nserver\n')
         self.assertEqual(self.store.conflicted('k'), ['s.jsonl'])
-        self.assertEqual(self.store.merge('k'), [], 'unchanged mirror files are not merged again')
+        self.assertEqual(self.store.merge('k'), ({}, []), 'unchanged mirror files are not merged again')
 
     def test_other_files_take_the_newer_version(self):
         self.put(self.store.main, 'memory/a.md', b'main', mtime=2000)
         self.put(self.mirror, 'memory/a.md', b'older', mtime=1000)
         self.put(self.store.main, 'memory/b.md', b'main', mtime=1000)
         self.put(self.mirror, 'memory/b.md', b'newer', mtime=2000)
-        self.store.merge('k')
+        self.assertEqual(self.store.merge('k'), ({'memory/b.md': 0}, []))
         self.assertEqual((self.store.main / 'memory/a.md').read_bytes(), b'main')
         self.assertEqual((self.store.main / 'memory/b.md').read_bytes(), b'newer')
+
+    def test_summary_lists_sessions_by_name(self):
+        renamed, titled = '76231e9d-6cb3-48e6-aaf3-3ac6bc22bc1e', '1d8011e3-4e77-4927-8e2e-b4a8a95aaf7e'
+        self.put(self.store.main, renamed + '.jsonl', b'{"type":"ai-title","aiTitle":"old"}\n'
+                 b'{"type":"custom-title","customTitle":"Mine"}\n{"type":"ai-title","aiTitle":"new"}\n')
+        self.put(self.store.main, titled + '.jsonl', b'{"type":"ai-title","aiTitle":"a"}\n'
+                 b'{"type":"ai-title","aiTitle":"b"}\nnot json Title"\n')
+        self.assertEqual(sessions.summarize({renamed + '.jsonl': 3, renamed + '/subagents/a.jsonl': 2,
+                                             titled + '.jsonl': 1, 'memory/MEMORY.md': 0,
+                                             'deadbeef-0000-0000-0000-000000000000.jsonl': 2}, self.store.main),
+                         ['76231e9d  Mine  +5 lines', '1d8011e3  b  +1 line', 'memory', 'deadbeef  +2 lines'])
+        self.put(self.store.main, titled + '/custom-title.json', b'{"customTitle": "Sidecar"}')
+        self.assertEqual(sessions.title(self.store.main / (titled + '.jsonl')), 'Sidecar')
 
     def test_pending_marks(self):
         self.store.set_pending('a', 'host-a')
@@ -98,12 +111,12 @@ class RemoteTests(unittest.TestCase):
         (a_dir / 's.jsonl').write_bytes(b'1\n')
         (a_dir / 'memory').mkdir()
         (a_dir / 'memory/MEMORY.md').write_text('note')
-        self.assertEqual(a.pull(self.store, 'a'), [])
+        self.assertEqual(a.pull(self.store, 'a'), ({'s.jsonl': 1, 'memory/MEMORY.md': 0}, []))
         with (a_dir / 's.jsonl').open('ab') as stream:
             stream.write(b'2\n')
-        a.pull(self.store, 'a')
+        self.assertEqual(a.pull(self.store, 'a'), ({'s.jsonl': 1}, []))
         b.pull(self.store, 'b')
-        b.push(self.store, 'b')
+        self.assertEqual(b.push(self.store, 'b'), {'s.jsonl': 2, 'memory/MEMORY.md': 0})
         self.assertEqual((b_dir / 's.jsonl').read_bytes(), b'1\n2\n')
         self.assertEqual((b_dir / 'memory/MEMORY.md').read_text(), 'note')
         with (b_dir / 's.jsonl').open('ab') as stream:
@@ -119,7 +132,7 @@ class RemoteTests(unittest.TestCase):
         (a_dir / 'fork.jsonl').write_bytes(b'1\nserver\n')
         (self.store.main).mkdir(parents=True)
         (self.store.main / 'fork.jsonl').write_bytes(b'1\nmain\n')
-        self.assertEqual(a.pull(self.store, 'a'), ['fork.jsonl'])
+        self.assertEqual(a.pull(self.store, 'a')[1], ['fork.jsonl'])
         with (a_dir / 'grow.jsonl').open('ab') as stream:
             stream.write(b'2\n')  # Claude keeps writing between pull and push
         a.push(self.store, 'a')

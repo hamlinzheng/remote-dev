@@ -1185,10 +1185,11 @@ class CliTests(unittest.TestCase):
             self.log.append(('pull', self.label))
             if self.fail:
                 raise RuntimeError(self.fail)
-            return self.diverged
+            return {self.label + '.jsonl': 2}, self.diverged
 
         def push(self, store, key):
             self.log.append(('push', self.label))
+            return {}
 
     def remotes(self, log, **options):
         def transcripts(values, name):
@@ -1303,6 +1304,8 @@ class CliTests(unittest.TestCase):
                                ('push', 'me@nexcom23'), ('push', 'user@host')])
         self.assertEqual(store.pending(), {'gone': 'old-server'})
         self.assertIn('Not connected, may hold newer transcripts: old-server', out.getvalue())
+        self.assertIn('  From user@host:22:\n    user@host  +2 lines\n', out.getvalue())
+        self.assertNotIn('  To ', out.getvalue(), 'nothing pushed, nothing listed')
         with patch.object(app.shutil, 'which', return_value=None):
             with self.assertRaisesRegex(RuntimeError, 'Install rsync'):
                 self.c.sync()

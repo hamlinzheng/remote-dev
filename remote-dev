@@ -270,7 +270,7 @@ class Sync:
             while not self.stopped.wait(self.interval):
                 with contextlib.suppress(OSError, RuntimeError, subprocess.SubprocessError):
                     with self.store.lock():
-                        self.diverged += self.remote.pull(self.store, self.values['key'])
+                        self.diverged += self.remote.pull(self.store, self.values['key'])[1]
         if self.interval:
             background(loop)
 
@@ -279,7 +279,7 @@ class Sync:
         key = self.values['key']
         try:
             with self.store.lock():
-                self.diverged += self.remote.pull(self.store, key)
+                self.diverged += self.remote.pull(self.store, key)[1]
                 if not self.controller.busy(key, self.name):
                     self.store.set_pending(key)
         except (OSError, RuntimeError, subprocess.SubprocessError) as error:
@@ -775,7 +775,9 @@ class Controller:
                    and same_process(record.get('ssh')) for _, record in self.sessions())
 
     def pull(self, store, values, remote):
-        warn_diverged(store, values, remote.pull(store, values['key']))
+        changed, diverged = remote.pull(store, values['key'])
+        warn_diverged(store, values, diverged)
+        return changed
 
     def sync_open(self, values, name):
         """Sync transcripts before Claude starts; failures only warn."""
@@ -821,15 +823,21 @@ class Controller:
         store = sessions.Store(self.data / 'sessions', name)
         with store.lock():
             remotes = [(values, self.transcripts(values, name)) for values in selected]
+            moved = [('From', values, self.pull(store, values, remote)) for values, remote in remotes]
             for values, remote in remotes:
-                self.pull(store, values, remote)
-            for values, remote in remotes:
-                remote.push(store, values['key'])
+                moved.append(('To', values, remote.push(store, values['key'])))
                 if not self.busy(values['key'], name):
                     store.set_pending(values['key'])
             missing = [label for key, label in store.pending().items()
                        if key not in {values['key'] for values in selected}]
         print('Synced transcripts of %s with %s.' % (name, ', '.join(describe(values) for values in selected)))
+        for direction, values, changes in moved:
+            if changes:
+                print('  %s %s:' % (direction, describe(values)))
+                for line in sessions.summarize(changes, store.main):
+                    print('    ' + line)
+        if not any(changes for _, _, changes in moved):
+            print('  Already up to date.')
         if missing:
             print('Not connected, may hold newer transcripts: ' + ', '.join(missing))
 
