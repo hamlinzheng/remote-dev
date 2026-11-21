@@ -79,7 +79,7 @@ remote-dev stop
 | --- | --- |
 | `install [-H TARGET] [--name NAME]` | Prepare dependencies, services and MCP configuration; remembers the target |
 | `start [-H TARGET] [--name NAME]` | Start shared access to a server; `--browser` enables local Chrome |
-| `open [-H TARGET] [PATH ...]` | Open a Claude session |
+| `open [-H TARGET] [PATH ...]` | Open a Claude session; `--no-sync` skips transcript sync |
 | `sync [-H TARGET] [PATH ...]` | Sync a workspace's Claude transcripts with running connections and list what moved per session; `open` does this automatically |
 | `status [-H TARGET] [--json]` | Inspect access, browser and sessions of all or one connection |
 | `stop [-H TARGET \| --all]` | Close a connection with its sessions, or all of them |
@@ -131,7 +131,7 @@ remote-dev open -H nex        # /resume lists the aws session too
 
 `open` first pulls the server's transcripts into the local copy and pushes the local copy back, then launches Claude. While Claude runs it pulls every 5 minutes, and once more after Claude exits. Transfers are incremental over the existing SSH connection: transcripts are append-only, so only new lines travel. Sync problems only warn; they never block `open`.
 
-- **Interval:** `REMOTE_DEV_SYNC_INTERVAL` sets the periodic pull in seconds; `0` disables it.
+- **Switches:** `open --no-sync` skips all syncing for that session. `REMOTE_DEV_SYNC_INTERVAL` sets the periodic pull in seconds; `0` disables only the periodic pull.
 - **Interrupted connections:** an interrupted transfer never leaves partial files or lines in the local copy and never changes the server's files; at most the last interval is missing locally until the next sync. A server whose transcripts may be newer than the local copy stays marked. The next `open` of that workspace pulls from it first if it is connected, otherwise it warns. After reconnecting, `remote-dev sync -H TARGET` (in the project directory) completes the transfer.
 - **Taking turns:** continue one session on one server at a time. If a transcript was extended on two servers, the local copy keeps its version. The server's version is saved under `~/.local/share/remote-dev/sessions/<workspace>/conflicts/<key>/` and is not overwritten on that server. Delete it to let the local version win, or copy it over `main/` to keep it instead.
 - **Other files:** auto-memory and similar files take the newer version. Deletions are not propagated.

@@ -1214,6 +1214,12 @@ class CliTests(unittest.TestCase):
         name = self.store().dir.name
         self.assertEqual(log, [('pull', 'user@host'), ('push', 'user@host'), ('launch', name), ('pull', 'user@host')])
         self.assertEqual(self.store().pending(), {}, 'a clean final pull clears the mark')
+        log.clear()
+        self.assertFalse(app.parser().parse_args(['open', '--no-sync']).sync)
+        with patch.object(self.c, 'connection_ready', return_value=True), \
+                patch.object(self.c, 'channel_command', side_effect=channel), self.remotes(log):
+            self.c.open([str(self.home)], sync_transcripts=False)
+        self.assertEqual(log, [('launch', name)], '--no-sync transfers nothing')
 
     def test_open_keeps_pending_mark_when_the_final_pull_fails(self):
         self.sync_patch.stop()

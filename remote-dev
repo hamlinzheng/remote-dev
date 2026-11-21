@@ -719,7 +719,7 @@ class Controller:
                     if values.get('watcher_owned'):
                         self.systemctl('stop', unit=paths.unit, check=False)
 
-    def open(self, paths, client='claude', host=None):
+    def open(self, paths, client='claude', host=None, sync_transcripts=True):
         if client != 'claude':
             raise ValueError('Codex is planned; only Claude is implemented')
         paths = canonical_paths(paths or [Path.cwd()])
@@ -734,7 +734,7 @@ class Controller:
                     if not any(within(path, base) for base in values['scope']):
                         raise ValueError('Path is outside configured development roots: ' + path +
                                          '; edit ' + str(self.config_file) + ' while stopped, then start again')
-            sync = self.sync_open(values, name)
+            sync = self.sync_open(values, name) if sync_transcripts else None
             with self.lock():
                 try:  # a local-dev login usually follows open, so the callback follows the session
                     if self.move_oauth(values):
@@ -1047,6 +1047,7 @@ def parser():
     opened.add_argument('paths', nargs='*', help='Local repository directories')
     opened.add_argument('-H', '--host', help=selector)
     opened.add_argument('--client', choices=['claude'], default='claude', help='Default: claude; Codex is planned')
+    opened.add_argument('--no-sync', dest='sync', action='store_false', help='Do not sync Claude transcripts')
     synced = commands.add_parser('sync', help="Sync a workspace's Claude transcripts with running connections")
     synced.add_argument('paths', nargs='*', help='Local repository directories as given to open; default: cwd')
     synced.add_argument('-H', '--host', help='Running connection, resolved like open --host; default: all')
@@ -1095,7 +1096,7 @@ def main(argv=None):
         elif args.command == 'uninstall':
             controller.uninstall(args.host, args.ssh_port, args.identity_file)
         elif args.command == 'open':
-            return controller.open(args.paths, args.client, args.host)
+            return controller.open(args.paths, args.client, args.host, args.sync)
         elif args.command == 'sync':
             controller.sync(args.paths, args.host)
         elif args.command == 'stop':
