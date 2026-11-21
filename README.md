@@ -46,6 +46,7 @@ Image paste: `Ctrl+V` in remote Claude runs a remote `xclip` shim that reads ima
 | Chrome | `google-chrome` and a desktop display, only for browser mode | Not required |
 | Terminal | OSC 52 clipboard support to copy Claude output, such as WezTerm or kitty; VTE terminals (GNOME Terminal, Terminator) ignore it | Not required |
 | Clipboard | X11 and `xclip` (`sudo apt install xclip`), only for image paste | Not required |
+| rsync | Only for sharing transcripts across servers | Only for sharing transcripts across servers |
 
 `--with-node` permits a private Node 24.22.2 download for Linux x64/arm64 when no compatible runtime exists. The archive is checked against official SHA256 checksums. Existing compatible Node is reused, including per-user installs (`~/.local/share/node-*`, nvm, volta, `~/.local/bin`) that a non-interactive SSH shell does not put on PATH; other prerequisites remain user-managed. No sudo or shell/account changes are required.
 
@@ -79,6 +80,7 @@ remote-dev stop
 | `install [-H TARGET] [--name NAME]` | Prepare dependencies, services and MCP configuration; remembers the target |
 | `start [-H TARGET] [--name NAME]` | Start shared access to a server; `--browser` enables local Chrome |
 | `open [-H TARGET] [PATH ...]` | Open a Claude session |
+| `sync [-H TARGET] [PATH ...]` | Sync a workspace's Claude transcripts with running connections; `open` does this automatically |
 | `status [-H TARGET] [--json]` | Inspect access, browser and sessions of all or one connection |
 | `stop [-H TARGET \| --all]` | Close a connection with its sessions, or all of them |
 | `auth [-H TARGET]` | Move the local OAuth callback port `8765` to a connection; `open` does this automatically |
@@ -117,6 +119,22 @@ Every successful `install --host` and `start` remembers its target, port, identi
 | `status` | All connections | One connection |
 
 Each command prints the resolved target. `REMOTE_DEV_HOST` is never ignored: if it names no running connection, the command fails. Explicit `--ssh-port` and `-i` override remembered values.
+
+### Continuing sessions on another server
+
+Each workspace's Claude transcripts and auto memory (the remote `~/.claude/projects/<workspace>/`) have one local copy, so a session started on one server can be continued on another with `/resume`:
+
+```bash
+remote-dev open -H aws        # work, then exit Claude
+remote-dev open -H nex        # /resume lists the aws session too
+```
+
+`open` first pulls the server's transcripts into the local copy and pushes the local copy back, then launches Claude. While Claude runs it pulls every 5 minutes, and once more after Claude exits. Transfers are incremental over the existing SSH connection: transcripts are append-only, so only new lines travel. Sync problems only warn; they never block `open`.
+
+- **Interval:** `REMOTE_DEV_SYNC_INTERVAL` sets the periodic pull in seconds; `0` disables it.
+- **Interrupted connections:** an interrupted transfer never leaves partial files or lines in the local copy and never changes the server's files; at most the last interval is missing locally until the next sync. A server whose transcripts may be newer than the local copy stays marked. The next `open` of that workspace pulls from it first if it is connected, otherwise it warns. After reconnecting, `remote-dev sync -H TARGET` (in the project directory) completes the transfer.
+- **Taking turns:** continue one session on one server at a time. If a transcript was extended on two servers, the local copy keeps its version. The server's version is saved under `~/.local/share/remote-dev/sessions/<workspace>/conflicts/<key>/` and is not overwritten on that server. Delete it to let the local version win, or copy it over `main/` to keep it instead.
+- **Other files:** auto-memory and similar files take the newer version. Deletions are not propagated.
 
 Limitations: all servers control the same Chrome pages. A machine can be connected only once: reaching the same server under two names or two users fails because its loopback ports `7676`/`7677` are already forwarded.
 
@@ -205,6 +223,7 @@ tests/                     isolated regression tests
 | `~/.config/remote-dev/devspace/` | Local configuration and owner authentication |
 | `~/.config/remote-dev/targets.json` | Remembered targets: host, port, identity-file path, name |
 | `~/.local/share/remote-dev/` | Managed runtimes and installation records; local DevSpace state |
+| `~/.local/share/remote-dev/sessions/<workspace>/` | Shared Claude transcripts: `main/`, per-server mirrors, conflicts, pending marks |
 | `$XDG_RUNTIME_DIR/remote-dev/` | `connections/<key>/` records with SSH and clipboard sockets, shared ownership, session records |
 | `~/.local/state/remote-dev/browser/` | Browser record and logs |
 | `~/.local/share/chrome-agent-dev/` | Local persistent Chrome profile |
@@ -233,7 +252,8 @@ GitHub Actions checks Python 3.8/3.12, CLI help and locked Node 24 dependency in
 
 ## TODO
 
-- [ ] Multiple remote targets concurrently.
+- [x] Multiple remote targets concurrently.
+- [x] Continue Claude sessions on another server.
 - [x] Selection-based copy: OSC 52 in a supporting terminal, such as WezTerm.
 - [x] Direct local clipboard image paste.
 - [ ] Remote Codex client adapter and acceptance tests.

@@ -4,7 +4,9 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import tempfile
+import threading
 
 
 def private_dir(path):
@@ -24,6 +26,15 @@ def atomic_json(path, value):
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def background(target):
+    """Start a daemon thread that leaves SIGINT/SIGTERM/SIGHUP to the main thread's defer_signals."""
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM, signal.SIGHUP})
+    try:
+        threading.Thread(target=target, daemon=True).start()
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 def validate_host(host):

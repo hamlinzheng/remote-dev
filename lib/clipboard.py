@@ -2,10 +2,10 @@
 import contextlib
 import hmac
 import re
-import signal
 import socket
 import subprocess
-import threading
+
+from lib.common import background
 
 PORT = 7677
 IMAGE = re.compile(rb'image/(png|jpeg|jpg|gif|webp|bmp)')
@@ -47,15 +47,6 @@ def answer(request, token):
     if target == b'TARGETS':
         return b''.join(line + b'\n' for line in xclip('TARGETS').splitlines() if IMAGE.fullmatch(line))
     return xclip(target.decode()) if IMAGE.fullmatch(target) else b''
-
-
-def background(target):
-    """Start a daemon thread that leaves SIGINT/SIGTERM/SIGHUP to the main thread's defer_signals."""
-    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM, signal.SIGHUP})
-    try:
-        threading.Thread(target=target, daemon=True).start()
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 def serve(path, token):

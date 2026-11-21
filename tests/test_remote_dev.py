@@ -29,6 +29,8 @@ class CliTests(unittest.TestCase):
         self.p = self.c.paths(self.key)
         self.move_patch = patch.object(self.c, 'move_oauth', return_value=False)
         self.move_patch.start()
+        self.sync_patch = patch.object(self.c, 'sync_open', return_value=None)
+        self.sync_patch.start()
         self.addCleanup(patch.stopall)
 
     def connection(self, **overrides):
@@ -1077,8 +1079,9 @@ class CliTests(unittest.TestCase):
         config = self.home / '.claude.json'
         if not config.exists():
             config.write_text('{"mcpServers":{"local-dev":{"type":"http","url":"http://127.0.0.1:7676/mcp"}}}')
-        payload = {'action': 'open', 'paths': ['/tmp/repo space;$(touch SHOULD_NOT_EXIST)'],
-                   'hostname': 'test-local', 'browser': browser}
+        paths = ['/tmp/repo space;$(touch SHOULD_NOT_EXIST)']
+        payload = {'action': 'open', 'paths': paths, 'browser': browser,
+                   'workspace': app.sessions.workspace_name('test-local', paths)}
         if target:
             payload['target'] = target
         environment = dict(os.environ, HOME=str(self.home))
@@ -1173,6 +1176,136 @@ class CliTests(unittest.TestCase):
         config.write_text(original)
         self.assertNotEqual(self.bootstrap().returncode, 0)
         self.assertEqual(config.read_text(), original)
+
+    class FakeRemote:
+        def __init__(self, log, label, diverged=(), fail=None):
+            self.log, self.label, self.diverged, self.fail = log, label, list(diverged), fail
+
+        def pull(self, store, key):
+            self.log.append(('pull', self.label))
+            if self.fail:
+                raise RuntimeError(self.fail)
+            return self.diverged
+
+        def push(self, store, key):
+            self.log.append(('push', self.label))
+
+    def remotes(self, log, **options):
+        def transcripts(values, name):
+            return self.FakeRemote(log, values['host'], **options.get(values['host'], {}))
+        return patch.object(self.c, 'transcripts', side_effect=transcripts)
+
+    def store(self):
+        return app.sessions.Store(self.c.data / 'sessions', app.sessions.workspace_name(socket.gethostname(),
+                                                                                       [str(self.home)]))
+
+    def test_open_syncs_before_launch_and_after_exit(self):
+        self.sync_patch.stop()
+        self.connection()
+        log = []
+        def channel(value, remote, tty=True):
+            log.append(('launch', json.loads(shlex.split(remote)[3])['workspace']))
+            return ['/bin/sh', '-c', 'exit 3']
+        with patch.object(self.c, 'connection_ready', return_value=True), \
+                patch.object(self.c, 'channel_command', side_effect=channel), self.remotes(log), \
+                patch.dict(os.environ, {'REMOTE_DEV_SYNC_INTERVAL': '0'}):
+            self.assertEqual(self.c.open([str(self.home)]), 3)
+        name = self.store().dir.name
+        self.assertEqual(log, [('pull', 'user@host'), ('push', 'user@host'), ('launch', name), ('pull', 'user@host')])
+        self.assertEqual(self.store().pending(), {}, 'a clean final pull clears the mark')
+
+    def test_open_keeps_pending_mark_when_the_final_pull_fails(self):
+        self.sync_patch.stop()
+        self.connection()
+        log, err = [], io.StringIO()
+        sync = self.c.sync_open.__func__
+        with patch.object(self.c, 'connection_ready', return_value=True), \
+                patch.object(self.c, 'channel_command', return_value=['/bin/true']), self.remotes(log), \
+                patch.object(app.sys, 'stderr', err):
+            real = sync(self.c, self.c.read_connection(self.key), self.store().dir.name)
+            real.remote = self.FakeRemote(log, 'user@host', fail='network is unreachable')
+            with patch.object(self.c, 'sync_open', return_value=real):
+                self.c.open([str(self.home)])
+        self.assertEqual(self.store().pending(), {self.key: 'user@host:22'})
+        self.assertIn('network is unreachable; run remote-dev sync -H user@host later', err.getvalue())
+
+    def test_open_pulls_pending_servers_first_and_warns_about_disconnected_ones(self):
+        self.sync_patch.stop()
+        a, b = self.two_connections()
+        store = self.store()
+        store.set_pending(b['key'], 'nexcom')
+        store.set_pending('gone', 'old-server')
+        log, err = [], io.StringIO()
+        with patch.object(self.c, 'connection_ready', return_value=True), \
+                patch.object(self.c, 'channel_command', return_value=['/bin/true']), \
+                self.remotes(log, **{'user@host': {'diverged': ['s.jsonl']}}), \
+                patch.object(app.sys, 'stderr', err), patch.dict(os.environ, {'REMOTE_DEV_SYNC_INTERVAL': '0'}):
+            self.c.open([str(self.home)], host='user@host')
+        self.assertEqual(log[:3], [('pull', 'me@nexcom23'), ('pull', 'user@host'), ('push', 'user@host')])
+        self.assertEqual(store.pending(), {'gone': 'old-server'})
+        self.assertIn('transcripts on old-server may be newer', err.getvalue())
+        self.assertIn('transcript s.jsonl on user@host:22 diverged', err.getvalue())
+
+    def test_open_without_rsync_still_opens(self):
+        self.sync_patch.stop()
+        self.connection()
+        err = io.StringIO()
+        with patch.object(self.c, 'connection_ready', return_value=True), \
+                patch.object(self.c, 'channel_command', return_value=['/bin/true']), \
+                patch.object(app.shutil, 'which', return_value=None), patch.object(app.sys, 'stderr', err):
+            self.assertEqual(self.c.open([str(self.home)]), 0)
+        self.assertIn('rsync not found', err.getvalue())
+
+    def test_invalid_sync_interval_fails_before_launch(self):
+        self.sync_patch.stop()
+        self.connection()
+        log = []
+        with patch.object(self.c, 'connection_ready', return_value=True), self.remotes(log), \
+                patch.object(self.c, 'channel_command', side_effect=AssertionError('launched')), \
+                patch.dict(os.environ, {'REMOTE_DEV_SYNC_INTERVAL': '5m'}):
+            with self.assertRaisesRegex(ValueError, 'whole seconds'):
+                self.c.open([str(self.home)])
+        self.assertEqual((log, self.store().pending()), ([], {}))
+
+    def test_periodic_pull_runs_while_claude_runs(self):
+        self.sync_patch.stop()
+        self.connection()
+        log = []
+        with patch.object(self.c, 'connection_ready', return_value=True), \
+                patch.object(self.c, 'channel_command', return_value=['/bin/sleep', '1.5']), self.remotes(log), \
+                patch.dict(os.environ, {'REMOTE_DEV_SYNC_INTERVAL': '1'}):
+            self.c.open([str(self.home)])
+        self.assertEqual(log, [('pull', 'user@host'), ('push', 'user@host'), ('pull', 'user@host'),
+                               ('pull', 'user@host')], 'before launch, once while running, after exit')
+
+    def test_live_session_keeps_the_pending_mark(self):
+        self.connection()
+        process = self.child()
+        name = self.store().dir.name
+        self.session('busy', process, workspace=name)
+        sync = app.Sync(self.c, self.store(), self.c.read_connection(self.key), self.FakeRemote([], 'x'), name)
+        self.store().set_pending(self.key, 'user@host')
+        sync.finish()
+        self.assertEqual(self.store().pending(), {self.key: 'user@host'})
+
+    def test_sync_command_pulls_all_then_pushes_and_clears_marks(self):
+        self.sync_patch.stop()
+        a, b = self.two_connections()
+        store = self.store()
+        store.set_pending(a['key'], 'a')
+        store.set_pending('gone', 'old-server')
+        log, out = [], io.StringIO()
+        self.assertEqual(app.parser().parse_args(['sync', '-H', 'nex']).host, 'nex')
+        with patch.object(self.c, 'connection_ready', return_value=True), self.remotes(log), \
+                patch.object(Path, 'cwd', return_value=self.home), patch.object(app.sys, 'stdout', out):
+            self.c.sync()
+        self.assertEqual(log, [('pull', 'me@nexcom23'), ('pull', 'user@host'),
+                               ('push', 'me@nexcom23'), ('push', 'user@host')])
+        self.assertEqual(store.pending(), {'gone': 'old-server'})
+        self.assertIn('Not connected, may hold newer transcripts: old-server', out.getvalue())
+        with patch.object(app.shutil, 'which', return_value=None):
+            with self.assertRaisesRegex(RuntimeError, 'Install rsync'):
+                self.c.sync()
 
 
 if __name__ == '__main__':

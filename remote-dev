@@ -11,11 +11,13 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 import types
 import urllib.request
@@ -30,10 +32,11 @@ BROWSER_FORWARD = ('-R', '127.0.0.1:9222:127.0.0.1:9222')
 MARKER = '# Managed by remote-dev.'
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-from lib.common import atomic_json, private_dir, process_record, ssh_options, validate_host
+from lib.common import atomic_json, background, private_dir, process_record, ssh_options, validate_host
 from lib.browser import Controller as Browser
 from lib import clipboard
 from lib import install as provisioning
+from lib import sessions
 
 
 class BusyError(RuntimeError):
@@ -90,7 +93,7 @@ def defer_signals():
 
 
 REMOTE_BOOTSTRAP = r"""
-import hashlib, json, os, pathlib, re, shutil, sys, tempfile
+import json, os, pathlib, shutil, sys, tempfile
 settings = json.loads(sys.argv[1])
 home = pathlib.Path.home()
 local_bin = str(home / '.local/bin')
@@ -126,16 +129,13 @@ if settings['action'] == 'prepare':
     raise SystemExit(0)
 if not existing:
     raise SystemExit('local-dev MCP is missing; stop access and run remote-dev install --host USER@HOST')
-identity = json.dumps({key: settings[key] for key in ['hostname', 'paths']}, sort_keys=True).encode()
 base = home / '.local/share/remote-dev'
 os.environ['PATH'] = str(base / 'bin') + os.pathsep + os.environ['PATH']
 workspaces = base / 'workspaces'
 workspaces.mkdir(parents=True, exist_ok=True, mode=0o700)
 os.chmod(base, 0o700)
 os.chmod(workspaces, 0o700)
-name = pathlib.Path(settings['paths'][0]).name if len(settings['paths']) == 1 else 'multi-repo'
-label = re.sub(r'[^A-Za-z0-9._-]+', '-', name).strip('.-')[:48] or 'workspace'
-directory = workspaces / (label + '-' + hashlib.sha256(identity).hexdigest()[:16])
+directory = workspaces / settings['workspace']
 directory.mkdir(parents=True, exist_ok=True, mode=0o700)
 instructions = directory / 'CLAUDE.md'
 header = '# Managed by remote-dev.\n'
@@ -156,9 +156,9 @@ os.execv(str(claude), [str(claude)])
 """
 
 
-def remote_command(action, paths=None, browser=False, target=None):
+def remote_command(action, paths=None, browser=False, target=None, workspace=None):
     payload = json.dumps({'action': action, 'paths': paths or [], 'target': target,
-                         'hostname': socket.gethostname(), 'browser': browser}, sort_keys=True)
+                          'workspace': workspace, 'browser': browser}, sort_keys=True)
     return shlex.join(['python3', '-c', REMOTE_BOOTSTRAP, payload])
 
 
@@ -246,6 +246,47 @@ def match_targets(query, candidates):
 def ambiguous(query, found):
     return RuntimeError('%s matches several targets: %s; use a longer --host, HOST:PORT, or =TARGET for an exact one'
                         % (query, ', '.join(describe(item) for item in found)))
+
+
+def warn_diverged(store, values, items):
+    for item in items:
+        print('Warning: transcript %s on %s diverged from the local copy; its version is kept in %s and not '
+              'overwritten there' % (item, describe(values), store.conflicts(values['key']) / item),
+              file=sys.stderr, flush=True)
+
+
+class Sync:
+    """Pull periodically while Claude runs and once after it exits."""
+
+    def __init__(self, controller, store, values, remote, name):
+        self.controller, self.store, self.values, self.remote, self.name = controller, store, values, remote, name
+        value = os.environ.get('REMOTE_DEV_SYNC_INTERVAL', str(sessions.INTERVAL))
+        if not value.isdigit():
+            raise ValueError('REMOTE_DEV_SYNC_INTERVAL must be whole seconds; 0 disables periodic sync')
+        self.interval, self.diverged, self.stopped = int(value), [], threading.Event()
+
+    def start(self):
+        def loop():
+            while not self.stopped.wait(self.interval):
+                with contextlib.suppress(OSError, RuntimeError, subprocess.SubprocessError):
+                    with self.store.lock():
+                        self.diverged += self.remote.pull(self.store, self.values['key'])
+        if self.interval:
+            background(loop)
+
+    def finish(self):
+        self.stopped.set()
+        key = self.values['key']
+        try:
+            with self.store.lock():
+                self.diverged += self.remote.pull(self.store, key)
+                if not self.controller.busy(key, self.name):
+                    self.store.set_pending(key)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            print('Warning: transcripts on %s were not synced back: %s; run remote-dev sync -H %s later'
+                  % (describe(self.values), error, self.values.get('name') or self.values['host']),
+                  file=sys.stderr, flush=True)
+        warn_diverged(self.store, self.values, self.diverged)
 
 
 class Controller:
@@ -459,11 +500,14 @@ class Controller:
         args += ssh_options(values['ssh_port'], values.get('identity_file'))
         return args + [values['host']]
 
-    def channel_command(self, values, command, tty=True):
+    def ssh_prefix(self, values, tty=False):
+        """ssh via the connection's master, without target and command."""
         return ['ssh', '-t' if tty else '-T', '-S', str(self.paths(values['key']).ssh),
                 '-p', str(values['ssh_port']), '-o', 'ControlMaster=no',
-                '-o', 'ProxyCommand=false', '-o', 'BatchMode=yes',
-                '-o', 'ForwardAgent=no', values['host'], command]
+                '-o', 'ProxyCommand=false', '-o', 'BatchMode=yes', '-o', 'ForwardAgent=no']
+
+    def channel_command(self, values, command, tty=True):
+        return self.ssh_prefix(values, tty) + [values['host'], command]
 
     def control(self, values, action, *args):
         return subprocess.run(['ssh', '-S', str(self.paths(values['key']).ssh), '-O', action,
@@ -679,7 +723,8 @@ class Controller:
         if client != 'claude':
             raise ValueError('Codex is planned; only Claude is implemented')
         paths = canonical_paths(paths or [Path.cwd()])
-        identifier, child, code = str(uuid.uuid4()), None, None
+        name = sessions.workspace_name(socket.gethostname(), paths)
+        identifier, child, code, sync = str(uuid.uuid4()), None, None, None
         try:
             with self.lock():
                 values = self.resolve_active(host)
@@ -689,19 +734,23 @@ class Controller:
                     if not any(within(path, base) for base in values['scope']):
                         raise ValueError('Path is outside configured development roots: ' + path +
                                          '; edit ' + str(self.config_file) + ' while stopped, then start again')
+            sync = self.sync_open(values, name)
+            with self.lock():
                 try:  # a local-dev login usually follows open, so the callback follows the session
                     if self.move_oauth(values):
                         print('OAuth callback 8765 now forwards to %s.' % describe(values), flush=True)
                 except (OSError, RuntimeError, subprocess.SubprocessError) as error:
                     print('Warning: ' + str(error), file=sys.stderr, flush=True)
-                command = remote_command('open', paths, values['browser'], values.get('name') or values['host'])
+                command = remote_command('open', paths, values['browser'], values.get('name') or values['host'], name)
                 with defer_signals() as previous_mask:
                     child = subprocess.Popen(self.channel_command(values, command),
                         preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask))
                     atomic_json(self.sessions_dir / (identifier + '.json'), {
                         'id': identifier, 'client': client, 'connection': values['key'], 'paths': paths,
-                        'ssh': process_record(child.pid)})
+                        'workspace': name, 'ssh': process_record(child.pid)})
             print('Claude session %s on %s: %s' % (identifier[:8], describe(values), ', '.join(paths)), flush=True)
+            if sync:
+                sync.start()
             code = child.wait()
             return code
         finally:
@@ -710,6 +759,79 @@ class Controller:
                 restore_terminal(clean=code == 0)
             with self.lock():
                 (self.sessions_dir / (identifier + '.json')).unlink(missing_ok=True)
+            if sync:
+                sync.finish()
+
+    def transcripts(self, values, name):
+        """Transcript transfer for a connection; None without local rsync."""
+        if not shutil.which('rsync'):
+            return None
+        cache = sessions.Store(self.data / 'sessions', name).state_file(values['key'], '.location')
+        return sessions.Remote(self.ssh_prefix(values), values['host'], name, cache)
+
+    def busy(self, key, name):
+        """Whether a live session of this workspace runs on that connection."""
+        return any(record.get('connection') == key and record.get('workspace') == name
+                   and same_process(record.get('ssh')) for _, record in self.sessions())
+
+    def pull(self, store, values, remote):
+        warn_diverged(store, values, remote.pull(store, values['key']))
+
+    def sync_open(self, values, name):
+        """Sync transcripts before Claude starts; failures only warn."""
+        remote = self.transcripts(values, name)
+        if remote is None:
+            print('Warning: rsync not found; transcripts are not synced across servers', file=sys.stderr, flush=True)
+            return None
+        store = sessions.Store(self.data / 'sessions', name)
+        sync = Sync(self, store, values, remote, name)
+        with store.lock():
+            for key, label in store.pending().items():
+                if key == values['key']:
+                    continue
+                other = self.read_connection(key)
+                try:
+                    if not other or not self.connection_ready(other):
+                        raise RuntimeError('it is not connected; start it and run remote-dev sync')
+                    self.pull(store, other, self.transcripts(other, name))
+                    if not self.busy(key, name):
+                        store.set_pending(key)
+                except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                    print('Warning: transcripts on %s may be newer than the local copy: %s' % (label, error),
+                          file=sys.stderr, flush=True)
+            try:
+                self.pull(store, values, remote)
+                remote.push(store, values['key'])
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                print('Warning: transcripts were not synced with %s: %s' % (describe(values), error),
+                      file=sys.stderr, flush=True)
+            store.set_pending(values['key'], describe(values))
+        return sync
+
+    def sync(self, paths=None, host=None):
+        if not shutil.which('rsync'):
+            raise RuntimeError('Install rsync locally to sync transcripts')
+        paths = canonical_paths(paths or [Path.cwd()])
+        name = sessions.workspace_name(socket.gethostname(), paths)
+        with self.lock():
+            selected = [self.resolve_active(host)] if host else self.connections()
+            selected = [values for values in selected if self.connection_ready(values)]
+        if not selected:
+            raise RuntimeError('No running connection to sync with')
+        store = sessions.Store(self.data / 'sessions', name)
+        with store.lock():
+            remotes = [(values, self.transcripts(values, name)) for values in selected]
+            for values, remote in remotes:
+                self.pull(store, values, remote)
+            for values, remote in remotes:
+                remote.push(store, values['key'])
+                if not self.busy(values['key'], name):
+                    store.set_pending(values['key'])
+            missing = [label for key, label in store.pending().items()
+                       if key not in {values['key'] for values in selected}]
+        print('Synced transcripts of %s with %s.' % (name, ', '.join(describe(values) for values in selected)))
+        if missing:
+            print('Not connected, may hold newer transcripts: ' + ', '.join(missing))
 
     def sessions(self):
         records = []
@@ -917,6 +1039,9 @@ def parser():
     opened.add_argument('paths', nargs='*', help='Local repository directories')
     opened.add_argument('-H', '--host', help=selector)
     opened.add_argument('--client', choices=['claude'], default='claude', help='Default: claude; Codex is planned')
+    synced = commands.add_parser('sync', help="Sync a workspace's Claude transcripts with running connections")
+    synced.add_argument('paths', nargs='*', help='Local repository directories as given to open; default: cwd')
+    synced.add_argument('-H', '--host', help='Running connection, resolved like open --host; default: all')
     status = commands.add_parser('status', help='Inspect shared access and individual sessions')
     status.add_argument('-H', '--host', help='Show one running connection; default: all')
     status.add_argument('--json', action='store_true')
@@ -963,6 +1088,8 @@ def main(argv=None):
             controller.uninstall(args.host, args.ssh_port, args.identity_file)
         elif args.command == 'open':
             return controller.open(args.paths, args.client, args.host)
+        elif args.command == 'sync':
+            controller.sync(args.paths, args.host)
         elif args.command == 'stop':
             controller.stop(args.host, args.all)
         elif args.command == 'auth':
